@@ -159,7 +159,7 @@ impl CtnEngine {
                 if triplet.starts_with(&target_prefix) {
                     // Update yang sudah ada
                     new_triplets.push(format!(
-                        "{},{},{:.2}",
+                        "{},{},{}",
                         sender_id_str, receiver_id_str, new_weight
                     ));
                     modified = true;
@@ -172,7 +172,7 @@ impl CtnEngine {
             // Jika relasi ini belum pernah ada (tapi ID sedernya ada di file ini), tambahkan ke ekor
             if !modified {
                 new_triplets.push(format!(
-                    "{},{},{:.2}",
+                    "{},{},{}",
                     sender_id_str, receiver_id_str, new_weight
                 ));
             }
