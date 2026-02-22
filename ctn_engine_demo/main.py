@@ -30,7 +30,7 @@ class DualLogger:
         self.terminal = sys.stdout
         self.log_file = open(filepath, "w", encoding="utf-8")
     def write(self, message):
-        self.terminal.write(message)
+        self.terminal.write(message.encode('cp1252', errors='replace').decode('cp1252'))
         self.log_file.write(message)
     def flush(self):
         self.terminal.flush()
@@ -169,7 +169,7 @@ def main():
         record_experience(sender, receiver, reward)
 
         # Cek apakah RAM sudah melewati threshold fisik
-        over_limit, ram_pct = check_ram_threshold(limit_percent=75.0)
+        over_limit, ram_pct = check_ram_threshold(limit_percent=95.0)
         print(f"  [RAM Monitor] Penggunaan RAM: {ram_pct:.1f}% "
               f"{'(THRESHOLD TERLAMPAUI → konsolidasi!)' if over_limit else '(masih aman)'}")
 
