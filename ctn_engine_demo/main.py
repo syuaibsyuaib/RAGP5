@@ -75,32 +75,40 @@ def rescorla_wagner(old_weight, reward, count=1):
 def consolidate(engine, connections_map):
     """
     Proses konsolidasi Hippocampus → Neokorteks.
-    Hanya memori dengan sinyal kuat (|peak| > 0.5 ATAU |akumulasi| > 0.8)
-    yang dituliskan ke file .ctn (SSD).
+    Menggunakan adaptive mean threshold berdasarkan riset:
+    "Emotional arousal tags memories as more significant than average."
+    Hanya memori dengan |peak| > rata-rata sinyal hari ini yang dikonsolidasi.
     """
     print("\n[KONSOLIDASI] Hippocampus → Neokorteks (SSD) dimulai...")
     consolidated_count = 0
+
+    if not hippocampus_buffer:
+        print("[KONSOLIDASI] Buffer kosong, tidak ada yang perlu dikonsolidasi.")
+        return
+
+    # Hitung rata-rata kekuatan sinyal dari semua entri di buffer (Adaptive Threshold)
+    mean_signal = sum(abs(e["peak"]) for e in hippocampus_buffer.values()) / len(hippocampus_buffer)
+    print(f"  [Adaptive Threshold] Rata-rata sinyal hari ini: {mean_signal:.3f}")
 
     for (sender_id, receiver_id), entry in hippocampus_buffer.items():
         acc = entry["accumulated_reward"]
         peak = entry["peak"]
 
-        # Filter selektif: hanya yang cukup kuat yang lolos ke Neokorteks
-        if abs(peak) > 0.5 or abs(acc) > 0.8:
-            # Cari weight lama dari grafik koneksi yang sudah kita tahu
+        # Filter adaptif: hanya yang di atas rata-rata yang lolos ke Neokorteks
+        if abs(peak) > mean_signal:
             old_weight = connections_map.get((sender_id, receiver_id), 0.5)
             new_weight = rescorla_wagner(old_weight, reward=acc, count=entry["count"])
 
             print(f"  [KONSOLIDASI] {sender_id}({translate(sender_id)}) → "
                   f"{receiver_id}({translate(receiver_id)}): "
                   f"weight {old_weight:.2f} → {new_weight:.2f} "
-                  f"(akum_reward={acc:.2f}, count={entry['count']})")
+                  f"(peak={peak:.2f} > mean={mean_signal:.2f})")
 
             engine.update_weight(sender_id, receiver_id, new_weight)
             consolidated_count += 1
         else:
-            print(f"  [BUANG] {sender_id}→{receiver_id}: sinyal terlalu lemah "
-                  f"(akum={acc:.2f}, peak={peak:.2f}) — tidak dikonsolidasi")
+            print(f"  [BUANG] {sender_id}→{receiver_id}: sinyal lemah "
+                  f"(peak={peak:.2f} ≤ mean={mean_signal:.2f}) — tidak dikonsolidasi")
 
     print(f"[KONSOLIDASI] Selesai. {consolidated_count}/{len(hippocampus_buffer)} "
           f"entri berhasil ditulis ke Neokorteks (.ctn).")
