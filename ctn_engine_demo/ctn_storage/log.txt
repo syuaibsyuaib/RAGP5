@@ -9,17 +9,17 @@
 
 [Episode 1] Stimulus: SENSOR_BAHAYA → Aksi: BERSEMBUNYI
   Hasil: GAGAL - ketahuan predator | Reward Signal: -0.60
-  [RAM Monitor] Penggunaan RAM: 85.9% (THRESHOLD TERLAMPAUI → konsolidasi!)
+  [RAM Monitor] Penggunaan RAM: 86.5% (THRESHOLD TERLAMPAUI → konsolidasi!)
 
 [KONSOLIDASI] Hippocampus → Neokorteks (SSD) dimulai...
-  [KONSOLIDASI] 1(SENSOR_BAHAYA) → 88(BERSEMBUNYI): weight 0.70 → 0.38 (akum_reward=-0.60, count=1)
+  [KONSOLIDASI] 1(SENSOR_BAHAYA) → 88(BERSEMBUNYI): weight 0.70 → 0.00 (akum_reward=-0.60, count=1)
 [KONSOLIDASI] Selesai. 1/1 entri berhasil ditulis ke Neokorteks (.ctn).
 [HIPPOCAMPUS] Buffer RAM dibersihkan (RAGP 'bangun tidur').
 
 
 [Episode 2] Stimulus: SENSOR_BAHAYA → Aksi: BERSEMBUNYI
   Hasil: GAGAL - predator mencium bau | Reward Signal: -0.50
-  [RAM Monitor] Penggunaan RAM: 85.9% (THRESHOLD TERLAMPAUI → konsolidasi!)
+  [RAM Monitor] Penggunaan RAM: 86.5% (THRESHOLD TERLAMPAUI → konsolidasi!)
 
 [KONSOLIDASI] Hippocampus → Neokorteks (SSD) dimulai...
   [BUANG] 1→88: sinyal terlalu lemah (akum=-0.50, peak=-0.50) — tidak dikonsolidasi
@@ -29,7 +29,7 @@
 
 [Episode 3] Stimulus: SENSOR_BAHAYA → Aksi: BERSEMBUNYI
   Hasil: BERHASIL - sembunyi di balik batu | Reward Signal: +0.30
-  [RAM Monitor] Penggunaan RAM: 85.9% (THRESHOLD TERLAMPAUI → konsolidasi!)
+  [RAM Monitor] Penggunaan RAM: 86.5% (THRESHOLD TERLAMPAUI → konsolidasi!)
 
 [KONSOLIDASI] Hippocampus → Neokorteks (SSD) dimulai...
   [BUANG] 1→88: sinyal terlalu lemah (akum=0.30, peak=0.30) — tidak dikonsolidasi
@@ -39,20 +39,20 @@
 
 [Episode 4] Stimulus: SENSOR_BAHAYA → Aksi: BERSEMBUNYI
   Hasil: GAGAL - posisi sembunyi buruk | Reward Signal: -0.70
-  [RAM Monitor] Penggunaan RAM: 85.9% (THRESHOLD TERLAMPAUI → konsolidasi!)
+  [RAM Monitor] Penggunaan RAM: 86.5% (THRESHOLD TERLAMPAUI → konsolidasi!)
 
 [KONSOLIDASI] Hippocampus → Neokorteks (SSD) dimulai...
-  [KONSOLIDASI] 1(SENSOR_BAHAYA) → 88(BERSEMBUNYI): weight 0.70 → 0.35 (akum_reward=-0.70, count=1)
+  [KONSOLIDASI] 1(SENSOR_BAHAYA) → 88(BERSEMBUNYI): weight 0.70 → 0.00 (akum_reward=-0.70, count=1)
 [KONSOLIDASI] Selesai. 1/1 entri berhasil ditulis ke Neokorteks (.ctn).
 [HIPPOCAMPUS] Buffer RAM dibersihkan (RAGP 'bangun tidur').
 
 
 [Episode 5] Stimulus: SENSOR_BAHAYA → Aksi: LARI_SEKARANG
   Hasil: BERHASIL - lari dan selamat | Reward Signal: +0.80
-  [RAM Monitor] Penggunaan RAM: 85.9% (THRESHOLD TERLAMPAUI → konsolidasi!)
+  [RAM Monitor] Penggunaan RAM: 86.5% (THRESHOLD TERLAMPAUI → konsolidasi!)
 
 [KONSOLIDASI] Hippocampus → Neokorteks (SSD) dimulai...
-  [KONSOLIDASI] 1(SENSOR_BAHAYA) → 45(LARI_SEKARANG): weight 0.90 → 0.88 (akum_reward=0.80, count=1)
+  [KONSOLIDASI] 1(SENSOR_BAHAYA) → 45(LARI_SEKARANG): weight 0.90 → 0.80 (akum_reward=0.80, count=1)
 [KONSOLIDASI] Selesai. 1/1 entri berhasil ditulis ke Neokorteks (.ctn).
 [HIPPOCAMPUS] Buffer RAM dibersihkan (RAGP 'bangun tidur').
 
@@ -67,7 +67,7 @@
 
 
 [Verifikasi Neokorteks] Membaca kembali memori BAHAYA (ID: 1) dari .ctn:
-  → 45 (LARI_SEKARANG): weight = 0.88
-  → 88 (BERSEMBUNYI): weight = 0.35
+  → 45 (LARI_SEKARANG): weight = 0.80
+  → 88 (BERSEMBUNYI): weight = 0.00
   → 12 (DIAM_TERPAKU): weight = 0.20
   → 23 (TERIAK_MINTA_TOLONG): weight = 0.50

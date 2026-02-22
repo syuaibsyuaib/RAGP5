@@ -59,11 +59,15 @@ def check_ram_threshold(limit_percent=75.0):
     used = psutil.virtual_memory().percent
     return used > limit_percent, used
 
-def rescorla_wagner(old_weight, reward, learning_rate=0.25):
+def rescorla_wagner(old_weight, reward, count=1):
     """
     Rumus Rescorla-Wagner: V_new = V_old + α × (R - V_old)
-    Menghitung weight baru berdasarkan reward aktual vs ekspektasi lama.
+    α = 1/count (Decaying Learning Rate):
+      - Episode 1: α = 1.0 (belajar penuh, belum ada referensi)
+      - Episode 5: α = 0.2 (sudah punya 4 pengalaman sebelumnya)
+      - Episode 10: α = 0.1 (makin stabil, susah digoyahkan)
     """
+    learning_rate = 1.0 / count  # decaying: makin banyak pengalaman, makin kecil α
     delta = learning_rate * (reward - old_weight)
     new_weight = old_weight + delta
     return max(0.0, min(1.0, new_weight))  # Clamp ke [0.0, 1.0]
@@ -85,7 +89,7 @@ def consolidate(engine, connections_map):
         if abs(peak) > 0.5 or abs(acc) > 0.8:
             # Cari weight lama dari grafik koneksi yang sudah kita tahu
             old_weight = connections_map.get((sender_id, receiver_id), 0.5)
-            new_weight = rescorla_wagner(old_weight, reward=acc)
+            new_weight = rescorla_wagner(old_weight, reward=acc, count=entry["count"])
 
             print(f"  [KONSOLIDASI] {sender_id}({translate(sender_id)}) → "
                   f"{receiver_id}({translate(receiver_id)}): "
