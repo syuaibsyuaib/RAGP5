@@ -1,0 +1,59 @@
+===========================================================================
+ RAGP HYBRID COGNITIVE ENGINE (B-TREE INDEXING) 
+===========================================================================
+
+[Tahap Fisik: Memori / CTN Index]
+Mengisi memori CTN dan membentukkan Peta B-Tree...
+
+[Tahap 3: Simulai Prefrontal Cortex (Evaluasi Solusi)]
+ -> Stimulus Masuk: ID 1 (SENSOR_BAHAYA)
+✅ RUST B-Tree: Menemukan file, Load file ke RAM, & Menarik relasi matematis selesai dalam 0.0542 ms
+   => Isi Array Relasi Mentah dari Rust: [('45', 0.9), ('88', 0.7), ('12', 0.2), ('23', 0.5)]
+
+ -> [LOG KOGNITIF] Pengetahuan ditemukan: Node 45 (LARI_SEKARANG) | Bobot Valensi: 0.9
+ -> [LOG KOGNITIF] Pengetahuan ditemukan: Node 88 (BERSEMBUNYI) | Bobot Valensi: 0.7
+ -> [LOG KOGNITIF] Pengetahuan ditemukan: Node 12 (DIAM_TERPAKU) | Bobot Valensi: 0.2
+ -> [LOG KOGNITIF] Pengetahuan ditemukan: Node 23 (TERIAK_MINTA_TOLONG) | Bobot Valensi: 0.5
+
+[Tahap 4: Simulasi Basal Ganglia (Pengambilan Keputusan/Value-Cost)]
+ Evaluasi Opsi [LARI_SEKARANG         ]: Value(0.90) - Cost(0.40) = Score(0.50)
+ Evaluasi Opsi [BERSEMBUNYI           ]: Value(0.70) - Cost(0.10) = Score(0.60)
+ Evaluasi Opsi [DIAM_TERPAKU          ]: Value(0.20) - Cost(0.00) = Score(0.20)
+ Evaluasi Opsi [TERIAK_MINTA_TOLONG   ]: Value(0.50) - Cost(0.20) = Score(0.30)
+
+***************************************************************************
+ HASIL KEPUTUSAN FINAL (EKSEKUSI MOTORIK) 
+ >>> Eksekusi Node ID: 88 <<<
+ >>> Terjemahan Aksi : BERSEMBUNYI (Skor Kepastian: 0.60) <<<
+***************************************************************************
+
+
+===========================================================================
+ >>> SIMULASI SKENARIO 2 (CROSS-CHUNK RETRIEVAL) <<< 
+===========================================================================
+
+[Tahap 3: Simulai Prefrontal Cortex (Evaluasi Lanjutan)]
+ -> Stimulus Masuk: ID 45 (LARI_SEKARANG)
+✅ RUST B-Tree: Transisi ke Chunk 'c2', Load file, & Ekstrak relasi dalam 0.0261 ms
+   => Isi Array Relasi Mentah dari Rust: [('99', 0.95)]
+
+ -> [LOG KOGNITIF] Pengetahuan ditemukan: Node 99 (SELAMAT_DARI_BAHAYA) | Bobot Valensi: 0.95
+
+
+===========================================================================
+ >>> SIMULASI SKENARIO 3 (PEMBELAJARAN / NEUROPLASTICITY) <<< 
+===========================================================================
+[Evaluasi Pasca-Aksi (Feedback Loop)]
+Sistem mengeksekusi: BERSEMBUNYI (88)
+HASIL: GAGAL! Predator tetap menyerang (Negative Reward / Pain Signal Diterima)
+
+[Memicu Long-Term Potentiation (LTP) ke Rust Engine]
+Menurunkan bobot Relasi 1 -> 88 dari 0.7 menjadi 0.1...
+✅ RUST LTP: Mengubah memori RAM & Menulis ulang file .ctn di SSD selesai dalam 0.7749 ms
+
+[Membuktikan Perubahan Memori Fisik]
+Mari kita panggil ulang Stimulus BAHAYA (ID: 1) untuk melihat ingatan barunya:
+ -> Pengetahuan: Node 45 (LARI_SEKARANG) | Bobot Valensi: 0.9
+ -> Pengetahuan: Node 88 (BERSEMBUNYI) | Bobot Valensi: 0.1 (<<<< UPDATE BARU!)
+ -> Pengetahuan: Node 12 (DIAM_TERPAKU) | Bobot Valensi: 0.2
+ -> Pengetahuan: Node 23 (TERIAK_MINTA_TOLONG) | Bobot Valensi: 0.5

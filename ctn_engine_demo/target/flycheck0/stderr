@@ -1,0 +1,196 @@
+   0.315006000s  INFO prepare_target{force=false package_id=ctn_engine v0.1.0 (D:\code\RAGP5\ctn_engine_demo) target="ctn_engine"}: cargo::core::compiler::fingerprint: fingerprint error for ctn_engine v0.1.0 (D:\code\RAGP5\ctn_engine_demo)/Check { test: false }/TargetInner { ..: lib_target("ctn_engine", ["cdylib"], "D:\\code\\RAGP5\\ctn_engine_demo\\src\\lib.rs", Edition2021) }
+   0.315162800s  INFO prepare_target{force=false package_id=ctn_engine v0.1.0 (D:\code\RAGP5\ctn_engine_demo) target="ctn_engine"}: cargo::core::compiler::fingerprint:     err: failed to read `D:\code\RAGP5\ctn_engine_demo\target\debug\.fingerprint\ctn_engine-d3838b472549bc45\lib-ctn_engine`
+
+Caused by:
+    The system cannot find the file specified. (os error 2)
+
+Stack backtrace:
+   0: git_midx_writer_dump
+   1: git_midx_writer_dump
+   2: git_midx_writer_dump
+   3: git_midx_writer_dump
+   4: git_filter_source_repo
+   5: git_filter_source_repo
+   6: git_filter_source_repo
+   7: git_filter_source_repo
+   8: git_filter_source_repo
+   9: git_filter_source_repo
+  10: git_filter_source_repo
+  11: git_libgit2_prerelease
+  12: <unknown>
+  13: <unknown>
+  14: <unknown>
+  15: <unknown>
+  16: git_midx_writer_dump
+  17: git_filter_source_repo
+  18: git_midx_writer_dump
+  19: BaseThreadInitThunk
+  20: RtlUserThreadStart
+   0.340979200s  INFO prepare_target{force=false package_id=pyo3 v0.21.2 target="pyo3"}: cargo::core::compiler::fingerprint: fingerprint error for pyo3 v0.21.2/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("pyo3", ["lib"], "C:\\Users\\SYUAIB\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\pyo3-0.21.2\\src\\lib.rs", Edition2021) }
+   0.341068700s  INFO prepare_target{force=false package_id=pyo3 v0.21.2 target="pyo3"}: cargo::core::compiler::fingerprint:     err: failed to read `D:\code\RAGP5\ctn_engine_demo\target\debug\.fingerprint\pyo3-7ac9e945d4981841\lib-pyo3`
+
+Caused by:
+    The system cannot find the file specified. (os error 2)
+
+Stack backtrace:
+   0: git_midx_writer_dump
+   1: git_midx_writer_dump
+   2: git_midx_writer_dump
+   3: git_midx_writer_dump
+   4: git_filter_source_repo
+   5: git_filter_source_repo
+   6: git_filter_source_repo
+   7: git_filter_source_repo
+   8: git_filter_source_repo
+   9: git_filter_source_repo
+  10: git_filter_source_repo
+  11: git_filter_source_repo
+  12: git_libgit2_prerelease
+  13: <unknown>
+  14: <unknown>
+  15: <unknown>
+  16: <unknown>
+  17: git_midx_writer_dump
+  18: git_filter_source_repo
+  19: git_midx_writer_dump
+  20: BaseThreadInitThunk
+  21: RtlUserThreadStart
+   0.355679100s  INFO prepare_target{force=false package_id=pyo3 v0.21.2 target="build-script-build"}: cargo::core::compiler::fingerprint: fingerprint error for pyo3 v0.21.2/RunCustomBuild/TargetInner { ..: custom_build_target("build-script-build", "C:\\Users\\SYUAIB\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\pyo3-0.21.2\\build.rs", Edition2021) }
+   0.355765800s  INFO prepare_target{force=false package_id=pyo3 v0.21.2 target="build-script-build"}: cargo::core::compiler::fingerprint:     err: failed to read `D:\code\RAGP5\ctn_engine_demo\target\debug\.fingerprint\pyo3-2c1fdf5e81c34a33\run-build-script-build-script-build`
+
+Caused by:
+    The system cannot find the file specified. (os error 2)
+
+Stack backtrace:
+   0: git_midx_writer_dump
+   1: git_midx_writer_dump
+   2: git_midx_writer_dump
+   3: git_midx_writer_dump
+   4: git_filter_source_repo
+   5: git_filter_source_repo
+   6: git_filter_source_repo
+   7: git_filter_source_repo
+   8: git_filter_source_repo
+   9: git_filter_source_repo
+  10: git_filter_source_repo
+  11: git_filter_source_repo
+  12: git_filter_source_repo
+  13: git_filter_source_repo
+  14: git_libgit2_prerelease
+  15: <unknown>
+  16: <unknown>
+  17: <unknown>
+  18: <unknown>
+  19: git_midx_writer_dump
+  20: git_filter_source_repo
+  21: git_midx_writer_dump
+  22: BaseThreadInitThunk
+  23: RtlUserThreadStart
+   0.363877000s  INFO prepare_target{force=false package_id=pyo3-ffi v0.21.2 target="build-script-build"}: cargo::core::compiler::fingerprint: fingerprint error for pyo3-ffi v0.21.2/RunCustomBuild/TargetInner { ..: custom_build_target("build-script-build", "C:\\Users\\SYUAIB\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\pyo3-ffi-0.21.2\\build.rs", Edition2021) }
+   0.363939600s  INFO prepare_target{force=false package_id=pyo3-ffi v0.21.2 target="build-script-build"}: cargo::core::compiler::fingerprint:     err: failed to read `D:\code\RAGP5\ctn_engine_demo\target\debug\.fingerprint\pyo3-ffi-b1ad63464d7f0a1b\run-build-script-build-script-build`
+
+Caused by:
+    The system cannot find the file specified. (os error 2)
+
+Stack backtrace:
+   0: git_midx_writer_dump
+   1: git_midx_writer_dump
+   2: git_midx_writer_dump
+   3: git_midx_writer_dump
+   4: git_filter_source_repo
+   5: git_filter_source_repo
+   6: git_filter_source_repo
+   7: git_filter_source_repo
+   8: git_filter_source_repo
+   9: git_filter_source_repo
+  10: git_filter_source_repo
+  11: git_filter_source_repo
+  12: git_filter_source_repo
+  13: git_filter_source_repo
+  14: git_filter_source_repo
+  15: git_libgit2_prerelease
+  16: <unknown>
+  17: <unknown>
+  18: <unknown>
+  19: <unknown>
+  20: git_midx_writer_dump
+  21: git_filter_source_repo
+  22: git_midx_writer_dump
+  23: BaseThreadInitThunk
+  24: RtlUserThreadStart
+   0.365637600s  INFO prepare_target{force=false package_id=pyo3-ffi v0.21.2 target="pyo3_ffi"}: cargo::core::compiler::fingerprint: fingerprint error for pyo3-ffi v0.21.2/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("pyo3_ffi", ["lib"], "C:\\Users\\SYUAIB\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\pyo3-ffi-0.21.2\\src\\lib.rs", Edition2021) }
+   0.365720400s  INFO prepare_target{force=false package_id=pyo3-ffi v0.21.2 target="pyo3_ffi"}: cargo::core::compiler::fingerprint:     err: failed to read `D:\code\RAGP5\ctn_engine_demo\target\debug\.fingerprint\pyo3-ffi-f9646bc55e804e70\lib-pyo3_ffi`
+
+Caused by:
+    The system cannot find the file specified. (os error 2)
+
+Stack backtrace:
+   0: git_midx_writer_dump
+   1: git_midx_writer_dump
+   2: git_midx_writer_dump
+   3: git_midx_writer_dump
+   4: git_filter_source_repo
+   5: git_filter_source_repo
+   6: git_filter_source_repo
+   7: git_filter_source_repo
+   8: git_filter_source_repo
+   9: git_filter_source_repo
+  10: git_filter_source_repo
+  11: git_filter_source_repo
+  12: git_filter_source_repo
+  13: git_libgit2_prerelease
+  14: <unknown>
+  15: <unknown>
+  16: <unknown>
+  17: <unknown>
+  18: git_midx_writer_dump
+  19: git_filter_source_repo
+  20: git_midx_writer_dump
+  21: BaseThreadInitThunk
+  22: RtlUserThreadStart
+   0.377918100s  INFO prepare_target{force=false package_id=ctn_engine v0.1.0 (D:\code\RAGP5\ctn_engine_demo) target="ctn_engine"}: cargo::core::compiler::fingerprint: fingerprint error for ctn_engine v0.1.0 (D:\code\RAGP5\ctn_engine_demo)/Check { test: true }/TargetInner { ..: lib_target("ctn_engine", ["cdylib"], "D:\\code\\RAGP5\\ctn_engine_demo\\src\\lib.rs", Edition2021) }
+   0.377990300s  INFO prepare_target{force=false package_id=ctn_engine v0.1.0 (D:\code\RAGP5\ctn_engine_demo) target="ctn_engine"}: cargo::core::compiler::fingerprint:     err: failed to read `D:\code\RAGP5\ctn_engine_demo\target\debug\.fingerprint\ctn_engine-42ac47d22f8456b2\test-lib-ctn_engine`
+
+Caused by:
+    The system cannot find the file specified. (os error 2)
+
+Stack backtrace:
+   0: git_midx_writer_dump
+   1: git_midx_writer_dump
+   2: git_midx_writer_dump
+   3: git_midx_writer_dump
+   4: git_filter_source_repo
+   5: git_filter_source_repo
+   6: git_filter_source_repo
+   7: git_filter_source_repo
+   8: git_filter_source_repo
+   9: git_filter_source_repo
+  10: git_filter_source_repo
+  11: git_libgit2_prerelease
+  12: <unknown>
+  13: <unknown>
+  14: <unknown>
+  15: <unknown>
+  16: git_midx_writer_dump
+  17: git_filter_source_repo
+  18: git_midx_writer_dump
+  19: BaseThreadInitThunk
+  20: RtlUserThreadStart
+   Compiling pyo3-ffi v0.21.2
+error: failed to run custom build command for `pyo3-ffi v0.21.2`
+note: To improve backtraces for build dependencies, set the CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG=true environment variable to enable debug information generation.
+
+Caused by:
+  process didn't exit successfully: `D:\code\RAGP5\ctn_engine_demo\target\debug\build\pyo3-ffi-0c53a061c3199ff2\build-script-build` (exit code: 1)
+  --- stdout
+  cargo:rerun-if-env-changed=PYO3_CROSS
+  cargo:rerun-if-env-changed=PYO3_CROSS_LIB_DIR
+  cargo:rerun-if-env-changed=PYO3_CROSS_PYTHON_VERSION
+  cargo:rerun-if-env-changed=PYO3_CROSS_PYTHON_IMPLEMENTATION
+  cargo:rerun-if-env-changed=PYO3_PRINT_CONFIG
+  cargo:rerun-if-env-changed=PYO3_USE_ABI3_FORWARD_COMPATIBILITY
+
+  --- stderr
+  error: the configured Python interpreter version (3.13) is newer than PyO3's maximum supported version (3.12)
+  = help: please check if an updated version of PyO3 is available. Current version: 0.21.2
+  = help: set PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 to suppress this check and build anyway using the stable ABI
