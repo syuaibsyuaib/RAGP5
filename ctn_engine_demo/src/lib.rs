@@ -120,6 +120,62 @@ impl CtnEngine {
         results
     }
 
+    /// TAHAP 9: COMPETITION DEGREE (BASAL GANGLIA)
+    /// Menghitung Cd = (value × opportunity) / cost untuk setiap aksi
+    /// dari stimulus tertentu, dengan mempertimbangkan konteks aktif.
+    /// Return: Vec<(aksi_id, Cd)> diurutkan dari Cd tertinggi.
+    fn compute_cd(&mut self, stimulus: &str, context: Vec<String>) -> Vec<(String, f64)> {
+        let mut cd_results: Vec<(String, f64)> = Vec::new();
+
+        // 1. Ambil semua aksi dari stimulus (value)
+        let actions = self.get_connections(stimulus);
+        if actions.is_empty() {
+            return cd_results;
+        }
+
+        for (action_id, value) in &actions {
+
+            // 2. Ambil cost: aksi → resource node (ambil weight tertinggi)
+            let cost_connections = self.get_connections(action_id);
+            let cost = if cost_connections.is_empty() {
+                1.0 // Tidak ada data cost = asumsikan maksimal (paling mahal)
+            } else {
+                let total: f64 = cost_connections.iter().map(|(_, w)| w).sum();
+                total / cost_connections.len() as f64
+            };
+
+            // 3. Ambil opportunity: context → aksi (rata-rata dari semua konteks aktif)
+            let mut opp_weights: Vec<f64> = Vec::new();
+            for ctx in &context {
+                let ctx_connections = self.get_connections(ctx);
+                for (target, w) in &ctx_connections {
+                    if target == action_id {
+                        opp_weights.push(*w);
+                    }
+                }
+            }
+            let opportunity = if opp_weights.is_empty() {
+                0.5 // Tidak ada data opportunity = netral
+            } else {
+                opp_weights.iter().sum::<f64>() / opp_weights.len() as f64
+            };
+
+            // 4. Hitung Cd
+            let cd = if cost == 0.0 {
+                f64::MAX // Cost nol = gratis = Cd tak terhingga
+            } else {
+                (value * opportunity) / cost
+            };
+
+            cd_results.push((action_id.clone(), cd));
+        }
+
+        // 5. Urutkan dari Cd tertinggi (pemenang kompetisi)
+        cd_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        cd_results
+    }
+
     /// TAHAP 7: NEUROPLASTICITY (LONG-TERM POTENTIATION)
     /// Mengubah bobot valensi dari memori yang sudah ada, atau menambahkan memori baru,
     /// dan langsung me-rewrite ke Hardisk.

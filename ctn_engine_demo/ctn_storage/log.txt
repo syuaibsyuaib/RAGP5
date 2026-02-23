@@ -9,23 +9,23 @@
 
 [Episode 1] Stimulus: SENSOR_BAHAYA → Aksi: BERSEMBUNYI
   Hasil: GAGAL - ketahuan predator | Reward Signal: -0.60
-  [RAM Monitor] Penggunaan RAM: 85.2% (masih aman)
+  [RAM Monitor] Penggunaan RAM: 89.0% (masih aman)
 
 [Episode 2] Stimulus: SENSOR_BAHAYA → Aksi: BERSEMBUNYI
   Hasil: GAGAL - predator mencium bau | Reward Signal: -0.50
-  [RAM Monitor] Penggunaan RAM: 85.2% (masih aman)
+  [RAM Monitor] Penggunaan RAM: 89.0% (masih aman)
 
 [Episode 3] Stimulus: SENSOR_BAHAYA → Aksi: BERSEMBUNYI
   Hasil: BERHASIL - sembunyi di balik batu | Reward Signal: +0.30
-  [RAM Monitor] Penggunaan RAM: 85.2% (masih aman)
+  [RAM Monitor] Penggunaan RAM: 89.0% (masih aman)
 
 [Episode 4] Stimulus: SENSOR_BAHAYA → Aksi: BERSEMBUNYI
   Hasil: GAGAL - posisi sembunyi buruk | Reward Signal: -0.70
-  [RAM Monitor] Penggunaan RAM: 85.2% (masih aman)
+  [RAM Monitor] Penggunaan RAM: 89.0% (masih aman)
 
 [Episode 5] Stimulus: SENSOR_BAHAYA → Aksi: LARI_SEKARANG
   Hasil: BERHASIL - lari dan selamat | Reward Signal: +0.80
-  [RAM Monitor] Penggunaan RAM: 85.2% (masih aman)
+  [RAM Monitor] Penggunaan RAM: 89.0% (masih aman)
 
 ===========================================================================
  WAKTU TIDUR — KONSOLIDASI AKHIR 
@@ -40,7 +40,36 @@
 
 
 [Verifikasi Neokorteks] Membaca kembali memori BAHAYA (ID: 1) dari .ctn:
-  → 45 (LARI_SEKARANG): weight = 0.80
-  → 88 (BERSEMBUNYI): weight = 0.70
-  → 12 (DIAM_TERPAKU): weight = 0.20
-  → 23 (TERIAK_MINTA_TOLONG): weight = 0.50
+  -> 45 (LARI_SEKARANG): weight = 0.80
+  -> 88 (BERSEMBUNYI): weight = 0.70
+  -> 12 (DIAM_TERPAKU): weight = 0.20
+  -> 23 (TERIAK_MINTA_TOLONG): weight = 0.50
+
+===========================================================================
+ PHASE 9: KOMPETISI AKSI (BASAL GANGLIA) 
+===========================================================================
+[Phase 9] Data cost dan opportunity berhasil dimuat.
+
+--- Skenario 1: Siang hari, tidak ada semak ---
+  Konteks aktif: tidak ada (netral)
+  Aksi: DIAM_TERPAKU              Cd = 2.0000
+  Aksi: BERSEMBUNYI               Cd = 1.7500
+  Aksi: TERIAK_MINTA_TOLONG       Cd = 0.5000
+  Aksi: LARI_SEKARANG             Cd = 0.4444
+  >> KEPUTUSAN: DIAM_TERPAKU
+
+--- Skenario 2: Malam hari, ada semak ---
+  Konteks aktif: ['MALAM', 'SEMAK_ADA']
+  Aksi: BERSEMBUNYI               Cd = 3.2375
+  Aksi: DIAM_TERPAKU              Cd = 2.0000
+  Aksi: TERIAK_MINTA_TOLONG       Cd = 0.5000
+  Aksi: LARI_SEKARANG             Cd = 0.1333
+  >> KEPUTUSAN: BERSEMBUNYI
+
+--- Skenario 3: Malam hari, tidak ada semak ---
+  Konteks aktif: ['MALAM']
+  Aksi: BERSEMBUNYI               Cd = 3.3250
+  Aksi: DIAM_TERPAKU              Cd = 2.0000
+  Aksi: TERIAK_MINTA_TOLONG       Cd = 0.5000
+  Aksi: LARI_SEKARANG             Cd = 0.1778
+  >> KEPUTUSAN: BERSEMBUNYI

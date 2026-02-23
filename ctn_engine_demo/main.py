@@ -20,6 +20,9 @@ SEMANTIC_DICT = {
     "12": "DIAM_TERPAKU",
     "23": "TERIAK_MINTA_TOLONG",
     "99": "SELAMAT_DARI_BAHAYA",
+    "100": "LELAH",
+    "101": "MALAM",
+    "102": "SEMAK_ADA",
 }
 
 def translate(node_id):
@@ -188,7 +191,48 @@ def main():
     print("\n[Verifikasi Neokorteks] Membaca kembali memori BAHAYA (ID: 1) dari .ctn:")
     updated_connections = engine.get_connections("1")
     for receiver_id, weight in updated_connections:
-        print(f"  → {receiver_id} ({translate(receiver_id)}): weight = {weight:.2f}")
+        print(f"  -> {receiver_id} ({translate(receiver_id)}): weight = {weight:.2f}")
+
+    # ==========================================================================
+    # PHASE 9: COMPETITION DEGREE (BASAL GANGLIA)
+    # ==========================================================================
+    print("\n" + "="*75)
+    print(" PHASE 9: KOMPETISI AKSI (BASAL GANGLIA) ")
+    print("="*75)
+
+    # Tambah data cost dan opportunity ke neokorteks
+    # cost:        aksi -> resource node (100=LELAH)
+    # opportunity: konteks -> aksi
+    engine.write_chunk("c3", "45,100,0.90|88,100,0.20|12,100,0.05|23,100,0.50")
+    engine.write_chunk("c4", "101,45,0.20|101,88,0.95|102,45,0.10|102,88,0.90")
+    print("[Phase 9] Data cost dan opportunity berhasil dimuat.\n")
+
+    # Skenario 1: Siang hari, tidak ada semak
+    print("--- Skenario 1: Siang hari, tidak ada semak ---")
+    context_1 = []  # tidak ada konteks khusus
+    hasil_1 = engine.compute_cd("1", context_1)
+    print(f"  Konteks aktif: tidak ada (netral)")
+    for aksi, cd in hasil_1:
+        print(f"  Aksi: {translate(aksi):25s} Cd = {cd:.4f}")
+    print(f"  >> KEPUTUSAN: {translate(hasil_1[0][0])}")
+
+    # Skenario 2: Malam hari, ada semak
+    print("\n--- Skenario 2: Malam hari, ada semak ---")
+    context_2 = ["101", "102"]  # 101=MALAM, 102=SEMAK_ADA
+    hasil_2 = engine.compute_cd("1", context_2)
+    print(f"  Konteks aktif: {[translate(c) for c in context_2]}")
+    for aksi, cd in hasil_2:
+        print(f"  Aksi: {translate(aksi):25s} Cd = {cd:.4f}")
+    print(f"  >> KEPUTUSAN: {translate(hasil_2[0][0])}")
+
+    # Skenario 3: Malam hari, tidak ada semak
+    print("\n--- Skenario 3: Malam hari, tidak ada semak ---")
+    context_3 = ["101"]  # 101=MALAM
+    hasil_3 = engine.compute_cd("1", context_3)
+    print(f"  Konteks aktif: {[translate(c) for c in context_3]}")
+    for aksi, cd in hasil_3:
+        print(f"  Aksi: {translate(aksi):25s} Cd = {cd:.4f}")
+    print(f"  >> KEPUTUSAN: {translate(hasil_3[0][0])}")
 
 if __name__ == "__main__":
     main()
