@@ -9,3 +9,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { version = "0.21.0", features = ["extension-module"] }
+lru = "0.12"
+crc32fast = "1.4"
+sysinfo = "0.30"

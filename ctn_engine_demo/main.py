@@ -1,238 +1,147 @@
-import time
+from __future__ import annotations
+
 import os
+import shutil
 import sys
-import psutil
+
+from environment import translate
+from ragp_loop import run_survival_loop
 
 try:
-    from ctn_engine import CtnEngine
+    from ctn_engine import RagpEngine
 except ImportError:
-    print("ERROR: Modul 'ctn_engine' dari Rust belum dikompilasi!")
-    print("Jalankan: pip install maturin && maturin develop --release")
-    exit(1)
+    print("ERROR: Modul 'ctn_engine' belum terpasang untuk interpreter ini.")
+    print("Gunakan interpreter .venv dan jalankan: maturin develop --release")
+    sys.exit(1)
 
-# ==============================================================================
-# KAMUS SEMANTIK (LLM/Language Layer Simulator)
-# ==============================================================================
-SEMANTIC_DICT = {
-    "1":  "SENSOR_BAHAYA",
-    "45": "LARI_SEKARANG",
-    "88": "BERSEMBUNYI",
-    "12": "DIAM_TERPAKU",
-    "23": "TERIAK_MINTA_TOLONG",
-    "99": "SELAMAT_DARI_BAHAYA",
-    "100": "LELAH",
-    "101": "MALAM",
-    "102": "SEMAK_ADA",
-}
 
-def translate(node_id):
-    return SEMANTIC_DICT.get(node_id, f"NODE_UNKNOWN_{node_id}")
+STORAGE_DIR = os.path.join(os.getcwd(), "ragp_storage")
+NODE_POOL_FULL = list(range(1, 110))
 
-class DualLogger:
-    def __init__(self, filepath):
-        self.terminal = sys.stdout
-        self.log_file = open(filepath, "w", encoding="utf-8")
-    def write(self, message):
-        self.terminal.write(message.encode('cp1252', errors='replace').decode('cp1252'))
-        self.log_file.write(message)
-    def flush(self):
-        self.terminal.flush()
-        self.log_file.flush()
+DEFAULT_MAX_STEPS = 100
+DEFAULT_SEED = 42
 
-# ==============================================================================
-# HIPPOCAMPUS BUFFER (RAM Layer)
-# Format: { (sender_id, receiver_id): {"accumulated_reward": float, "count": int, "peak": float} }
-# ==============================================================================
-hippocampus_buffer = {}
+# Shared RAM buffer for short-term reward traces.
+hippocampus: dict = {}
 
-def record_experience(sender_id, receiver_id, reward):
-    """Merekam pengalaman baru ke Hippocampus Buffer (RAM)."""
-    key = (sender_id, receiver_id)
-    if key not in hippocampus_buffer:
-        hippocampus_buffer[key] = {"accumulated_reward": 0.0, "count": 0, "peak": 0.0}
-    
-    entry = hippocampus_buffer[key]
-    entry["accumulated_reward"] += reward
-    entry["count"] += 1
-    if abs(reward) > abs(entry["peak"]):
-        entry["peak"] = reward
 
-def check_ram_threshold(limit_percent=75.0):
-    """Mengecek apakah RAM sudah melewati batas fisik - threshold biologis RAGP."""
-    used = psutil.virtual_memory().percent
-    return used > limit_percent, used
+def _truthy(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
-def rescorla_wagner(old_weight, reward, count=1):
-    """
-    Rumus Rescorla-Wagner: V_new = V_old + α × (R - V_old)
-    α = 1/count (Decaying Learning Rate):
-      - Episode 1: α = 1.0 (belajar penuh, belum ada referensi)
-      - Episode 5: α = 0.2 (sudah punya 4 pengalaman sebelumnya)
-      - Episode 10: α = 0.1 (makin stabil, susah digoyahkan)
-    """
-    learning_rate = 1.0 / count  # decaying: makin banyak pengalaman, makin kecil α
-    delta = learning_rate * (reward - old_weight)
-    new_weight = old_weight + delta
-    return max(0.0, min(1.0, new_weight))  # Clamp ke [0.0, 1.0]
 
-def consolidate(engine, connections_map):
-    """
-    Proses konsolidasi Hippocampus → Neokorteks.
-    Menggunakan adaptive mean threshold berdasarkan riset:
-    "Emotional arousal tags memories as more significant than average."
-    Hanya memori dengan |peak| > rata-rata sinyal hari ini yang dikonsolidasi.
-    """
-    print("\n[KONSOLIDASI] Hippocampus → Neokorteks (SSD) dimulai...")
-    consolidated_count = 0
+def should_reset(argv: list[str]) -> bool:
+    return ("--reset" in argv) or _truthy(os.getenv("RAGP_RESET_STORAGE"))
 
-    if not hippocampus_buffer:
-        print("[KONSOLIDASI] Buffer kosong, tidak ada yang perlu dikonsolidasi.")
+
+def base_file_exists(storage_dir: str) -> bool:
+    base_path = os.path.join(storage_dir, "base.bin")
+    return os.path.exists(base_path) and os.path.getsize(base_path) >= 14
+
+
+def rescorla_wagner(old_weight: float, reward: float, count: int = 1) -> float:
+    alpha = 1.0 / max(count, 1)
+    new_w = old_weight + alpha * (reward - old_weight)
+    return max(0.0, min(1.0, new_w))
+
+
+def seed_initial_knowledge(engine: RagpEngine):
+    print("[Init] Menanamkan insting dasar...")
+
+    engine.update_weight(1, 45, 0.3)    # BAHAYA -> LARI
+    engine.update_weight(1, 88, 0.2)    # BAHAYA -> SEMBUNYI
+    engine.update_weight(1, 12, 0.1)    # BAHAYA -> DIAM
+
+    engine.update_weight(103, 106, 0.3) # LAPAR -> CARI_MAKAN
+    engine.update_weight(103, 107, 0.2) # LAPAR -> MAKAN
+
+    engine.update_weight(100, 108, 0.3) # LELAH -> ISTIRAHAT
+    engine.update_weight(100, 109, 0.2) # LELAH -> TIDUR
+
+    engine.update_weight(104, 109, 0.3) # SAKIT -> TIDUR
+    engine.update_weight(104, 108, 0.2) # SAKIT -> ISTIRAHAT
+
+    engine.update_weight(45, 100, 0.15) # Cost LARI
+    engine.update_weight(88, 100, 0.05) # Cost SEMBUNYI
+    engine.update_weight(12, 100, 0.02) # Cost DIAM
+    engine.update_weight(106, 100, 0.10) # Cost CARI_MAKAN
+    engine.update_weight(107, 103, 0.05) # MAKAN menurunkan LAPAR
+
+    engine.update_weight(101, 88, 0.2)  # MALAM -> SEMBUNYI
+    engine.update_weight(101, 45, 0.05) # MALAM -> LARI rendah
+
+    merged, pruned = engine.consolidate()
+    print(f"[Init] Insting dasar tersimpan. merged={merged} pruned={pruned}")
+    print(f"[Init] {engine.status()}")
+
+
+def consolidate_hippocampus(engine: RagpEngine, buffer: dict, verbose: bool = True):
+    if not buffer:
+        if verbose:
+            print("[Konsolidasi] Buffer kosong.")
         return
 
-    # Hitung rata-rata kekuatan sinyal dari semua entri di buffer (Adaptive Threshold)
-    mean_signal = sum(abs(e["peak"]) for e in hippocampus_buffer.values()) / len(hippocampus_buffer)
-    print(f"  [Adaptive Threshold] Rata-rata sinyal hari ini: {mean_signal:.3f}")
+    mean_signal = sum(abs(e["peak"]) for e in buffer.values()) / len(buffer)
+    if verbose:
+        print(f"[Konsolidasi] {len(buffer)} entri | mean_signal={mean_signal:.3f}")
 
-    for (sender_id, receiver_id), entry in hippocampus_buffer.items():
-        acc = entry["accumulated_reward"]
-        peak = entry["peak"]
+    consolidated = 0
+    for (sender, receiver), entry in buffer.items():
+        if abs(entry["peak"]) <= mean_signal:
+            continue
 
-        # Filter adaptif: hanya yang di atas rata-rata yang lolos ke Neokorteks
-        if abs(peak) > mean_signal:
-            old_weight = connections_map.get((sender_id, receiver_id), 0.5)
-            new_weight = rescorla_wagner(old_weight, reward=acc, count=entry["count"])
+        old_weight = dict(engine.get_connections(sender)).get(receiver, 0.5)
+        new_weight = rescorla_wagner(old_weight, entry["acc"], entry["count"])
+        engine.update_weight(sender, receiver, new_weight)
+        consolidated += 1
 
-            print(f"  [KONSOLIDASI] {sender_id}({translate(sender_id)}) → "
-                  f"{receiver_id}({translate(receiver_id)}): "
-                  f"weight {old_weight:.2f} → {new_weight:.2f} "
-                  f"(peak={peak:.2f} > mean={mean_signal:.2f})")
+        if verbose:
+            print(
+                f"  [{translate(sender)}->{translate(receiver)}] "
+                f"{old_weight:.3f} -> {new_weight:.3f} (peak={entry['peak']:+.2f})"
+            )
 
-            engine.update_weight(sender_id, receiver_id, new_weight)
-            consolidated_count += 1
-        else:
-            print(f"  [BUANG] {sender_id}→{receiver_id}: sinyal lemah "
-                  f"(peak={peak:.2f} ≤ mean={mean_signal:.2f}) — tidak dikonsolidasi")
+    if verbose:
+        print(f"[Konsolidasi] {consolidated}/{len(buffer)} entri ditulis.")
 
-    print(f"[KONSOLIDASI] Selesai. {consolidated_count}/{len(hippocampus_buffer)} "
-          f"entri berhasil ditulis ke Neokorteks (.ctn).")
 
-def clear_hippocampus():
-    """Membersihkan staging buffer RAM setelah konsolidasi (bangun tidur)."""
-    hippocampus_buffer.clear()
-    print("[HIPPOCAMPUS] Buffer RAM dibersihkan (RAGP 'bangun tidur').\n")
+def build_konsolidasi_fn():
+    def _fn(hpc: dict, engine: RagpEngine, verbose: bool = True):
+        consolidate_hippocampus(engine, hpc, verbose=verbose)
+        merged, pruned = engine.consolidate()
+        if verbose:
+            print(f"[Engine] merged={merged} pruned={pruned}")
+            print(f"[Status] {engine.status()}")
 
-# ==============================================================================
-# MAIN SIMULATION
-# ==============================================================================
+    return _fn
+
+
 def main():
-    memory_dir = os.path.join(os.getcwd(), "ctn_storage")
-    if not os.path.exists(memory_dir):
-        os.makedirs(memory_dir)
+    reset_requested = should_reset(sys.argv[1:])
+    if reset_requested and os.path.exists(STORAGE_DIR):
+        shutil.rmtree(STORAGE_DIR)
+        print(f"[Init] Storage lama dihapus: {STORAGE_DIR}")
 
-    log_path = os.path.join(memory_dir, "log.txt")
-    sys.stdout = DualLogger(log_path)
+    first_init = not base_file_exists(STORAGE_DIR)
+    engine = RagpEngine(STORAGE_DIR)
 
-    print("="*75)
-    print(" RAGP COGNITIVE ENGINE — PHASE 8: HIPPOCAMPUS / NEOCORTEX ")
-    print("="*75)
+    if first_init:
+        engine.init_node_pool(NODE_POOL_FULL)
+        print(f"[Init] Node pool dibuat. {engine.status()}")
+        seed_initial_knowledge(engine)
+    else:
+        print(f"[Resume] Melanjutkan state base+delta. {engine.status()}")
 
-    # --- NEOKORTEKS: Inisialisasi file .ctn (SSD) ---
-    engine = CtnEngine(memory_dir)
-    engine.write_chunk("c1", "1,45,0.90|1,88,0.70|1,12,0.20|1,23,0.50")
-    engine.write_chunk("c2", "45,99,0.95|88,99,0.80")
-    print("[Neokorteks] File .ctn berhasil dimuat ke B-Tree index Rust.\n")
+    run_survival_loop(
+        engine=engine,
+        hippocampus=hippocampus,
+        konsolidasi_fn=build_konsolidasi_fn(),
+        max_steps=DEFAULT_MAX_STEPS,
+        seed=DEFAULT_SEED,
+        verbose=True,
+    )
 
-    # Peta weight referensi (untuk Rescorla-Wagner lookup)
-    known_weights = {
-        ("1", "45"): 0.90, ("1", "88"): 0.70,
-        ("1", "12"): 0.20, ("1", "23"): 0.50,
-    }
-
-    # --- SIMULASI MULTI-PENGALAMAN ---
-    print("="*75)
-    print(" SIMULASI PENGALAMAN BERULANG (5 Episode) ")
-    print("="*75)
-
-    # Skenario: 5x ketemu bahaya, setiap kali mencoba SEMBUNYI (88)
-    # Hasil bervariasi: kadang berhasil, kadang gagal
-    episodes = [
-        ("1", "88", -0.60, "GAGAL - ketahuan predator"),
-        ("1", "88", -0.50, "GAGAL - predator mencium bau"),
-        ("1", "88",  0.30, "BERHASIL - sembunyi di balik batu"),
-        ("1", "88", -0.70, "GAGAL - posisi sembunyi buruk"),
-        ("1", "45",  0.80, "BERHASIL - lari dan selamat"),
-    ]
-
-    for i, (sender, receiver, reward, desc) in enumerate(episodes, 1):
-        print(f"\n[Episode {i}] Stimulus: {translate(sender)} → "
-              f"Aksi: {translate(receiver)}")
-        print(f"  Hasil: {desc} | Reward Signal: {reward:+.2f}")
-
-        # Rekam ke Hippocampus Buffer (RAM)
-        record_experience(sender, receiver, reward)
-
-        # Cek apakah RAM sudah melewati threshold fisik
-        over_limit, ram_pct = check_ram_threshold(limit_percent=95.0)
-        print(f"  [RAM Monitor] Penggunaan RAM: {ram_pct:.1f}% "
-              f"{'(THRESHOLD TERLAMPAUI → konsolidasi!)' if over_limit else '(masih aman)'}")
-
-        if over_limit:
-            consolidate(engine, known_weights)
-            clear_hippocampus()
-
-    # Konsolidasi akhir setelah semua episode selesai (simulasi "waktu tidur")
-    print("\n" + "="*75)
-    print(" WAKTU TIDUR — KONSOLIDASI AKHIR ")
-    print("="*75)
-    consolidate(engine, known_weights)
-    clear_hippocampus()
-
-    # Buktikan perubahan di Neokorteks (SSD)
-    print("\n[Verifikasi Neokorteks] Membaca kembali memori BAHAYA (ID: 1) dari .ctn:")
-    updated_connections = engine.get_connections("1")
-    for receiver_id, weight in updated_connections:
-        print(f"  -> {receiver_id} ({translate(receiver_id)}): weight = {weight:.2f}")
-
-    # ==========================================================================
-    # PHASE 9: COMPETITION DEGREE (BASAL GANGLIA)
-    # ==========================================================================
-    print("\n" + "="*75)
-    print(" PHASE 9: KOMPETISI AKSI (BASAL GANGLIA) ")
-    print("="*75)
-
-    # Tambah data cost dan opportunity ke neokorteks
-    # cost:        aksi -> resource node (100=LELAH)
-    # opportunity: konteks -> aksi
-    engine.write_chunk("c3", "45,100,0.90|88,100,0.20|12,100,0.05|23,100,0.50")
-    engine.write_chunk("c4", "101,45,0.20|101,88,0.95|102,45,0.10|102,88,0.90")
-    print("[Phase 9] Data cost dan opportunity berhasil dimuat.\n")
-
-    # Skenario 1: Siang hari, tidak ada semak
-    print("--- Skenario 1: Siang hari, tidak ada semak ---")
-    context_1 = []  # tidak ada konteks khusus
-    hasil_1 = engine.compute_cd("1", context_1)
-    print(f"  Konteks aktif: tidak ada (netral)")
-    for aksi, cd in hasil_1:
-        print(f"  Aksi: {translate(aksi):25s} Cd = {cd:.4f}")
-    print(f"  >> KEPUTUSAN: {translate(hasil_1[0][0])}")
-
-    # Skenario 2: Malam hari, ada semak
-    print("\n--- Skenario 2: Malam hari, ada semak ---")
-    context_2 = ["101", "102"]  # 101=MALAM, 102=SEMAK_ADA
-    hasil_2 = engine.compute_cd("1", context_2)
-    print(f"  Konteks aktif: {[translate(c) for c in context_2]}")
-    for aksi, cd in hasil_2:
-        print(f"  Aksi: {translate(aksi):25s} Cd = {cd:.4f}")
-    print(f"  >> KEPUTUSAN: {translate(hasil_2[0][0])}")
-
-    # Skenario 3: Malam hari, tidak ada semak
-    print("\n--- Skenario 3: Malam hari, tidak ada semak ---")
-    context_3 = ["101"]  # 101=MALAM
-    hasil_3 = engine.compute_cd("1", context_3)
-    print(f"  Konteks aktif: {[translate(c) for c in context_3]}")
-    for aksi, cd in hasil_3:
-        print(f"  Aksi: {translate(aksi):25s} Cd = {cd:.4f}")
-    print(f"  >> KEPUTUSAN: {translate(hasil_3[0][0])}")
 
 if __name__ == "__main__":
     main()

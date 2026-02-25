@@ -1,252 +1,1148 @@
+﻿
 use pyo3::prelude::*;
-use std::collections::{BTreeMap, HashMap};
-use std::fs;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::env;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
-/// Mesin Parser CTN Bawah Tanah (Rust)
-/// Memproses dan Menyimpan Ingatan Graf Jaringan Saraf
+use lru::LruCache;
+use sysinfo::System;
+
+const MAGIC_BASE: u32 = 0x5241_4750; // "RAGP"
+const MAGIC_DELTA: u32 = 0x4445_4C54; // "DELT"
+const VERSION: u16 = 1;
+
+const BASE_HEADER_SIZE: u64 = 14;
+const NODE_INDEX_SIZE: u64 = 32;
+const SYNAPSE_SIZE: u64 = 12;
+const DELTA_HEADER_SIZE: u64 = 8;
+const DELTA_ENTRY_SIZE: u64 = 28;
+const CHUNK_SPAN: u64 = 100;
+const OFFSET_CHUNK_FLAG: u64 = 1_u64 << 63;
+
+const MAX_SYNAPSES_PER_NODE: u32 = 7000;
+const LRU_CAPACITY: usize = 1000;
+const INITIAL_WEIGHT: f32 = 0.01;
+const DEFAULT_THRESHOLD: f32 = 0.2;
+const PRUNE_RATIO: f32 = 0.3;
+const TEMPORAL_WINDOW_SIZE: usize = 5;
+const MAX_SPREAD_DEPTH: u8 = 4;
+
+const CACHE_RECOMPUTE_ACCESS_INTERVAL: u32 = 500;
+const DEFAULT_CACHE_POLICY: &str = "pinned_lru";
+const DEFAULT_CACHE_RAM_FRACTION: f32 = 0.25;
+const DEFAULT_CACHE_RAM_MIN_MB: u64 = 256;
+const DEFAULT_CACHE_RAM_MAX_MB: u64 = 1536;
+const DEFAULT_CACHE_PIN_FRACTION: f32 = 0.35;
+
+#[derive(Clone, Debug)]
+struct NodeMeta {
+    node_id: u64,
+    synapse_count: u32,
+    synapse_offset: u64,
+    threshold: f32,
+    checksum: u32,
+}
+
+#[derive(Clone, Debug)]
+struct Synapse {
+    receiver_id: u64,
+    weight: f32,
+}
+
+#[derive(Clone, Debug)]
+struct DeltaEntry {
+    sender_id: u64,
+    receiver_id: u64,
+    weight: f32,
+    timestamp: u32,
+}
+
 #[pyclass]
-struct CtnEngine {
-    // Folder tempat menyimpan file fisik .ctn
-    storage_path: PathBuf,
+struct RagpEngine {
+    storage_dir: PathBuf,
+    base_path: PathBuf,
+    delta_path: PathBuf,
+    node_index: HashMap<u64, NodeMeta>,
+    delta_index: HashMap<u64, HashMap<u64, (f32, u32)>>,
+    activation: HashMap<u64, f32>,
+    temporal_window: VecDeque<(u64, f32, u32)>,
+    tick: u32,
 
-    // ==========================================
-    // TAHAP 6: B-TREE INDEXING
-    // Peta yang memberi tahu sistem di file mana sebuah ID berada.
-    // Kunci: ID Pengirim (Matematis), Nilai: Nama File Chunk (c1, c2, dst)
-    // BTreeMap pada Rust secara otomatis diurutkan (O(log n) search time).
-    // ==========================================
-    index: BTreeMap<u64, String>,
+    // Hybrid cache: pinned + LRU
+    base_cache: LruCache<u64, Vec<Synapse>>,
+    pinned_cache: HashMap<u64, Vec<Synapse>>,
+    pinned_set: HashSet<u64>,
+    access_count: HashMap<u64, u32>,
+    access_since_recompute: u32,
 
-    // Kunci: ID Chunk (Leaf), Nilai: String CTN 1 baris
-    // Ini adalah Working Memory (RAM)
-    loaded_chunks: HashMap<String, String>,
+    // Cache policy config
+    cache_policy: String,
+    cache_ram_fraction: f32,
+    cache_ram_min_mb: u64,
+    cache_ram_max_mb: u64,
+    cache_pin_fraction: f32,
+
+    // Computed cache budgets/metrics
+    cache_budget_bytes: u64,
+    pinned_budget_bytes: u64,
+    lru_budget_bytes: u64,
+    cache_bytes_est: u64,
+    pinned_bytes_est: u64,
+    lru_bytes_est: u64,
+}
+
+impl RagpEngine {
+    fn crc32(data: &[u8]) -> u32 {
+        crc32fast::hash(data)
+    }
+
+    fn env_f32(key: &str, default: f32) -> f32 {
+        env::var(key)
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(default)
+    }
+
+    fn env_u64(key: &str, default: u64) -> u64 {
+        env::var(key)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(default)
+    }
+
+    fn env_policy(key: &str, default: &str) -> String {
+        let policy = env::var(key).unwrap_or_else(|_| default.to_string());
+        let normalized = policy.trim().to_ascii_lowercase();
+        if normalized == "pinned_lru" || normalized == "lru" {
+            normalized
+        } else {
+            default.to_string()
+        }
+    }
+
+    fn clamp_f32(v: f32, lo: f32, hi: f32) -> f32 {
+        v.max(lo).min(hi)
+    }
+
+    fn normalize_available_bytes(raw: u64) -> u64 {
+        // Sysinfo versions differ (bytes vs KiB). Normalize to bytes heuristically.
+        if raw < (1_u64 << 31) {
+            raw.saturating_mul(1024)
+        } else {
+            raw
+        }
+    }
+
+    fn node_cache_bytes_from_len(len: usize) -> u64 {
+        (len as u64).saturating_mul(SYNAPSE_SIZE).saturating_add(64)
+    }
+
+    fn chunk_start_for_sender(sender: u64) -> u64 {
+        if sender == 0 {
+            return 1;
+        }
+        ((sender - 1) / CHUNK_SPAN) * CHUNK_SPAN + 1
+    }
+
+    fn chunk_end_from_start(start: u64) -> u64 {
+        start.saturating_add(CHUNK_SPAN - 1)
+    }
+
+    fn chunk_file_name(start: u64) -> String {
+        let end = Self::chunk_end_from_start(start);
+        format!("base_{:06}_{:06}.bin", start, end)
+    }
+
+    fn chunk_file_path(&self, start: u64) -> PathBuf {
+        self.storage_dir.join(Self::chunk_file_name(start))
+    }
+
+    fn encode_chunk_offset(chunk_start: u64, local_offset: u32) -> u64 {
+        OFFSET_CHUNK_FLAG | (chunk_start << 32) | u64::from(local_offset)
+    }
+
+    fn is_chunk_offset(encoded: u64) -> bool {
+        (encoded & OFFSET_CHUNK_FLAG) != 0
+    }
+
+    fn decode_chunk_offset(encoded: u64) -> (u64, u64) {
+        let chunk_start = (encoded & !OFFSET_CHUNK_FLAG) >> 32;
+        let local_offset = encoded & 0xFFFF_FFFF;
+        (chunk_start, local_offset)
+    }
+
+    fn chunk_file_starts(&self) -> Vec<u64> {
+        let mut out: Vec<u64> = Vec::new();
+        let Ok(entries) = fs::read_dir(&self.storage_dir) else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with("base_") || !name.ends_with(".bin") {
+                continue;
+            }
+            let raw = name.trim_end_matches(".bin");
+            let parts: Vec<&str> = raw.split('_').collect();
+            if parts.len() != 3 {
+                continue;
+            }
+            if let Ok(start) = parts[1].parse::<u64>() {
+                out.push(start);
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    fn clear_chunk_files(&self) {
+        let starts = self.chunk_file_starts();
+        for start in starts {
+            let _ = fs::remove_file(self.chunk_file_path(start));
+        }
+    }
+
+    fn has_chunk_files(&self) -> bool {
+        !self.chunk_file_starts().is_empty()
+    }
+
+    fn refresh_cache_budget(&mut self) {
+        let mut sys = System::new();
+        sys.refresh_memory();
+
+        let avail_raw = sys.available_memory();
+        let avail_bytes = Self::normalize_available_bytes(avail_raw);
+
+        let fraction = Self::clamp_f32(self.cache_ram_fraction, 0.01, 0.90);
+        let min_bytes = self.cache_ram_min_mb.saturating_mul(1024 * 1024);
+        let max_bytes = self.cache_ram_max_mb.saturating_mul(1024 * 1024).max(min_bytes);
+
+        let mut target = ((avail_bytes as f64) * (fraction as f64)) as u64;
+        if target < min_bytes {
+            target = min_bytes;
+        }
+        if target > max_bytes {
+            target = max_bytes;
+        }
+
+        self.cache_budget_bytes = target;
+        if self.cache_policy == "pinned_lru" {
+            let pin_fraction = Self::clamp_f32(self.cache_pin_fraction, 0.05, 0.90);
+            self.pinned_budget_bytes = ((target as f64) * (pin_fraction as f64)) as u64;
+            self.lru_budget_bytes = target.saturating_sub(self.pinned_budget_bytes);
+        } else {
+            self.pinned_budget_bytes = 0;
+            self.lru_budget_bytes = target;
+        }
+
+        self.enforce_cache_budget();
+    }
+
+    fn recount_cache_bytes(&mut self) {
+        self.pinned_bytes_est = self
+            .pinned_cache
+            .values()
+            .map(|v| Self::node_cache_bytes_from_len(v.len()))
+            .sum();
+        self.lru_bytes_est = self
+            .base_cache
+            .iter()
+            .map(|(_, v)| Self::node_cache_bytes_from_len(v.len()))
+            .sum();
+        self.cache_bytes_est = self.pinned_bytes_est.saturating_add(self.lru_bytes_est);
+    }
+    fn pinned_score_from_synapses(&self, node_id: u64, synapses: &[Synapse], max_access: f32) -> f32 {
+        let max_weight = synapses
+            .iter()
+            .fold(0.0_f32, |acc, s| if s.weight > acc { s.weight } else { acc });
+        let access = self.access_count.get(&node_id).copied().unwrap_or(0) as f32;
+        let access_norm = if max_access <= 0.0 { 0.0 } else { access / max_access };
+        0.6 * max_weight + 0.4 * access_norm
+    }
+
+    fn lowest_scored_pinned_cached(&self) -> Option<u64> {
+        let max_access = self.access_count.values().copied().max().unwrap_or(1) as f32;
+        let mut worst: Option<(u64, f32)> = None;
+        for (node_id, synapses) in &self.pinned_cache {
+            let score = self.pinned_score_from_synapses(*node_id, synapses, max_access);
+            match worst {
+                Some((_, wscore)) if score >= wscore => {}
+                _ => worst = Some((*node_id, score)),
+            }
+        }
+        worst.map(|(id, _)| id)
+    }
+
+    fn enforce_cache_budget(&mut self) {
+        self.recount_cache_bytes();
+
+        while self.lru_bytes_est > self.lru_budget_bytes {
+            if self.base_cache.pop_lru().is_none() {
+                break;
+            }
+            self.recount_cache_bytes();
+        }
+
+        if self.cache_policy == "pinned_lru" {
+            while self.pinned_bytes_est > self.pinned_budget_bytes {
+                let Some(victim) = self.lowest_scored_pinned_cached() else {
+                    break;
+                };
+                self.pinned_cache.remove(&victim);
+                self.pinned_set.remove(&victim);
+                self.recount_cache_bytes();
+            }
+        }
+
+        while self.cache_bytes_est > self.cache_budget_bytes {
+            if self.base_cache.pop_lru().is_some() {
+                self.recount_cache_bytes();
+                continue;
+            }
+            let Some(victim) = self.lowest_scored_pinned_cached() else {
+                break;
+            };
+            self.pinned_cache.remove(&victim);
+            self.pinned_set.remove(&victim);
+            self.recount_cache_bytes();
+        }
+    }
+
+    fn get_cached_or_load_base(&mut self, sender: u64) -> Vec<Synapse> {
+        if self.cache_policy == "pinned_lru" {
+            if let Some(v) = self.pinned_cache.get(&sender) {
+                return v.clone();
+            }
+        }
+
+        if let Some(v) = self.base_cache.get(&sender) {
+            return v.clone();
+        }
+
+        let loaded = self.load_from_base(sender);
+        if self.cache_policy == "pinned_lru" && self.pinned_set.contains(&sender) {
+            self.pinned_cache.insert(sender, loaded.clone());
+        } else {
+            self.base_cache.put(sender, loaded.clone());
+        }
+        self.enforce_cache_budget();
+        loaded
+    }
+
+    fn invalidate_sender_cache(&mut self, sender: u64) {
+        self.pinned_cache.remove(&sender);
+        self.base_cache.pop(&sender);
+        self.enforce_cache_budget();
+    }
+
+    fn record_access(&mut self, sender: u64) {
+        let entry = self.access_count.entry(sender).or_insert(0);
+        *entry = entry.saturating_add(1);
+        self.access_since_recompute = self.access_since_recompute.saturating_add(1);
+        if self.access_since_recompute >= CACHE_RECOMPUTE_ACCESS_INTERVAL {
+            self.access_since_recompute = 0;
+            self.refresh_cache_budget();
+            self.recompute_pinned_set(false);
+        }
+    }
+
+    fn recompute_pinned_set(&mut self, eager_warm: bool) {
+        if self.cache_policy != "pinned_lru" {
+            self.pinned_set.clear();
+            self.pinned_cache.clear();
+            self.enforce_cache_budget();
+            return;
+        }
+
+        let max_access = self.access_count.values().copied().max().unwrap_or(1) as f32;
+        let node_ids: Vec<u64> = self.node_index.keys().copied().collect();
+        let mut scored: Vec<(u64, f32, u64)> = Vec::with_capacity(node_ids.len());
+
+        for node_id in node_ids {
+            let synapses = if let Some(v) = self.pinned_cache.get(&node_id) {
+                v.clone()
+            } else if let Some(v) = self.base_cache.get(&node_id) {
+                v.clone()
+            } else {
+                self.load_from_base(node_id)
+            };
+            let score = self.pinned_score_from_synapses(node_id, &synapses, max_access);
+            let est = Self::node_cache_bytes_from_len(synapses.len());
+            scored.push((node_id, score, est));
+        }
+
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut new_pinned: HashSet<u64> = HashSet::new();
+        let mut used: u64 = 0;
+        for (node_id, _, est) in scored {
+            let next = used.saturating_add(est);
+            if !new_pinned.is_empty() && next > self.pinned_budget_bytes {
+                continue;
+            }
+            if new_pinned.is_empty() && est > self.pinned_budget_bytes {
+                new_pinned.insert(node_id);
+                used = est;
+                continue;
+            }
+            if next <= self.pinned_budget_bytes {
+                new_pinned.insert(node_id);
+                used = next;
+            }
+        }
+        self.pinned_set = new_pinned;
+
+        let old_pinned_keys: Vec<u64> = self.pinned_cache.keys().copied().collect();
+        for key in old_pinned_keys {
+            if !self.pinned_set.contains(&key) {
+                if let Some(v) = self.pinned_cache.remove(&key) {
+                    self.base_cache.put(key, v);
+                }
+            }
+        }
+
+        let keys_to_promote: Vec<u64> = self.pinned_set.iter().copied().collect();
+        for key in keys_to_promote {
+            if self.pinned_cache.contains_key(&key) {
+                continue;
+            }
+            if let Some(v) = self.base_cache.pop(&key) {
+                self.pinned_cache.insert(key, v);
+                continue;
+            }
+            if eager_warm {
+                let loaded = self.load_from_base(key);
+                self.pinned_cache.insert(key, loaded);
+            }
+        }
+
+        self.enforce_cache_budget();
+    }
+    fn load_node_index(&mut self) {
+        self.node_index.clear();
+        let mut f = match File::open(&self.base_path) {
+            Ok(file) => file,
+            Err(_) => return,
+        };
+
+        let mut header = [0_u8; BASE_HEADER_SIZE as usize];
+        if f.read_exact(&mut header).is_err() {
+            return;
+        }
+
+        let magic = u32::from_le_bytes(header[0..4].try_into().unwrap());
+        if magic != MAGIC_BASE {
+            return;
+        }
+
+        let node_count = u32::from_le_bytes(header[6..10].try_into().unwrap());
+        for _ in 0..node_count {
+            let mut rec = [0_u8; NODE_INDEX_SIZE as usize];
+            if f.read_exact(&mut rec).is_err() {
+                break;
+            }
+            let node_id = u64::from_le_bytes(rec[0..8].try_into().unwrap());
+            let synapse_count = u32::from_le_bytes(rec[8..12].try_into().unwrap());
+            let synapse_offset = u64::from_le_bytes(rec[12..20].try_into().unwrap());
+            let threshold = f32::from_le_bytes(rec[20..24].try_into().unwrap());
+            let checksum = u32::from_le_bytes(rec[24..28].try_into().unwrap());
+            self.node_index.insert(
+                node_id,
+                NodeMeta {
+                    node_id,
+                    synapse_count,
+                    synapse_offset,
+                    threshold,
+                    checksum,
+                },
+            );
+        }
+    }
+
+    fn load_delta_index(&mut self) {
+        let mut f = match File::open(&self.delta_path) {
+            Ok(file) => file,
+            Err(_) => return,
+        };
+
+        let mut header = [0_u8; DELTA_HEADER_SIZE as usize];
+        if f.read_exact(&mut header).is_err() {
+            return;
+        }
+        let magic = u32::from_le_bytes(header[0..4].try_into().unwrap());
+        if magic != MAGIC_DELTA {
+            return;
+        }
+        let version = u16::from_le_bytes(header[4..6].try_into().unwrap());
+        if version != VERSION {
+            return;
+        }
+
+        let file_size = match f.metadata() {
+            Ok(m) => m.len(),
+            Err(_) => return,
+        };
+        if file_size <= DELTA_HEADER_SIZE {
+            return;
+        }
+
+        let entry_count = (file_size - DELTA_HEADER_SIZE) / DELTA_ENTRY_SIZE;
+        let mut max_ts = self.tick;
+        for _ in 0..entry_count {
+            let mut raw = [0_u8; DELTA_ENTRY_SIZE as usize];
+            if f.read_exact(&mut raw).is_err() {
+                break;
+            }
+
+            let payload = &raw[0..24];
+            let checksum = u32::from_le_bytes(raw[24..28].try_into().unwrap());
+            if Self::crc32(payload) != checksum {
+                continue;
+            }
+
+            let sender = u64::from_le_bytes(raw[0..8].try_into().unwrap());
+            let receiver = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+            let weight = f32::from_le_bytes(raw[16..20].try_into().unwrap());
+            let timestamp = u32::from_le_bytes(raw[20..24].try_into().unwrap());
+
+            if !self.node_index.contains_key(&sender) || !self.node_index.contains_key(&receiver) {
+                continue;
+            }
+
+            let sender_map = self.delta_index.entry(sender).or_default();
+            match sender_map.get(&receiver) {
+                Some((_, old_ts)) if *old_ts > timestamp => {}
+                _ => {
+                    sender_map.insert(receiver, (weight, timestamp));
+                }
+            }
+
+            let next_tick = timestamp.saturating_add(1);
+            if next_tick > max_ts {
+                max_ts = next_tick;
+            }
+        }
+        if max_ts > self.tick {
+            self.tick = max_ts;
+        }
+    }
+
+    fn read_synapses_at(&self, offset: u64, count: u32) -> Vec<Synapse> {
+        if offset == u64::MAX || count == 0 {
+            return Vec::new();
+        }
+        let mut f = if Self::is_chunk_offset(offset) {
+            let (chunk_start, local_offset) = Self::decode_chunk_offset(offset);
+            let path = self.chunk_file_path(chunk_start);
+            let Ok(mut file) = File::open(path) else {
+                return Vec::new();
+            };
+            if file.seek(SeekFrom::Start(local_offset)).is_err() {
+                return Vec::new();
+            }
+            file
+        } else {
+            // Legacy monolithic format fallback.
+            let Ok(mut file) = File::open(&self.base_path) else {
+                return Vec::new();
+            };
+            if file.seek(SeekFrom::Start(offset)).is_err() {
+                return Vec::new();
+            }
+            file
+        };
+
+        let mut synapses = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            let mut buf = [0_u8; SYNAPSE_SIZE as usize];
+            if f.read_exact(&mut buf).is_err() {
+                break;
+            }
+            let receiver_id = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+            let weight = f32::from_le_bytes(buf[8..12].try_into().unwrap());
+            synapses.push(Synapse { receiver_id, weight });
+        }
+        synapses
+    }
+
+    fn load_from_base(&mut self, sender: u64) -> Vec<Synapse> {
+        let (offset, count) = match self.node_index.get(&sender) {
+            Some(meta) => (meta.synapse_offset, meta.synapse_count),
+            None => return Vec::new(),
+        };
+        self.read_synapses_at(offset, count)
+    }
+
+    fn append_delta_entry(&self, entry: &DeltaEntry) {
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.delta_path)
+            .expect("Gagal membuka delta.bin");
+
+        let mut payload = [0_u8; 24];
+        payload[0..8].copy_from_slice(&entry.sender_id.to_le_bytes());
+        payload[8..16].copy_from_slice(&entry.receiver_id.to_le_bytes());
+        payload[16..20].copy_from_slice(&entry.weight.to_le_bytes());
+        payload[20..24].copy_from_slice(&entry.timestamp.to_le_bytes());
+        let checksum = Self::crc32(&payload);
+
+        f.write_all(&payload).unwrap();
+        f.write_all(&checksum.to_le_bytes()).unwrap();
+    }
+
+    fn init_delta_if_needed(&self) {
+        if self.delta_path.exists() {
+            return;
+        }
+        let mut f = File::create(&self.delta_path).expect("Gagal membuat delta.bin");
+        f.write_all(&MAGIC_DELTA.to_le_bytes()).unwrap();
+        f.write_all(&VERSION.to_le_bytes()).unwrap();
+        f.write_all(&0_u16.to_le_bytes()).unwrap();
+    }
+
+    fn synapse_count_for(&self, sender: u64) -> u32 {
+        let base = self.node_index.get(&sender).map_or(0, |m| m.synapse_count);
+        let delta = self.delta_index.get(&sender).map_or(0, |m| m.len() as u32);
+        base.saturating_add(delta)
+    }
+
+    fn write_base_manifest_and_chunks(&mut self, all_data: &[(u64, Vec<Synapse>)]) {
+        self.clear_chunk_files();
+
+        let mut chunk_buffers: HashMap<u64, Vec<u8>> = HashMap::new();
+        let mut records: Vec<(u64, u32, u64, f32, u32)> = Vec::new();
+
+        for (node_id, synapses) in all_data {
+            let threshold = self
+                .node_index
+                .get(node_id)
+                .map_or(DEFAULT_THRESHOLD, |m| m.threshold);
+
+            if synapses.is_empty() {
+                records.push((*node_id, 0, u64::MAX, threshold, 0));
+                continue;
+            }
+
+            let chunk_start = Self::chunk_start_for_sender(*node_id);
+            let chunk_buf = chunk_buffers.entry(chunk_start).or_default();
+            let local_offset = chunk_buf.len() as u64;
+            if local_offset > u32::MAX as u64 {
+                panic!("Chunk offset overflow for sender {}", node_id);
+            }
+
+            let mut syn_bytes: Vec<u8> = Vec::with_capacity(synapses.len() * SYNAPSE_SIZE as usize);
+            for s in synapses {
+                syn_bytes.extend_from_slice(&s.receiver_id.to_le_bytes());
+                syn_bytes.extend_from_slice(&s.weight.to_le_bytes());
+            }
+            let checksum = Self::crc32(&syn_bytes);
+            chunk_buf.extend_from_slice(&syn_bytes);
+
+            let encoded_offset = Self::encode_chunk_offset(chunk_start, local_offset as u32);
+            records.push((*node_id, synapses.len() as u32, encoded_offset, threshold, checksum));
+        }
+
+        records.sort_by_key(|(node_id, _, _, _, _)| *node_id);
+        let node_count = records.len() as u32;
+
+        let mut manifest = File::create(&self.base_path).expect("Gagal menulis base manifest");
+        manifest.write_all(&MAGIC_BASE.to_le_bytes()).unwrap();
+        manifest.write_all(&VERSION.to_le_bytes()).unwrap();
+        manifest.write_all(&node_count.to_le_bytes()).unwrap();
+        manifest.write_all(&0_u32.to_le_bytes()).unwrap();
+        for (node_id, count, offset, threshold, checksum) in &records {
+            manifest.write_all(&node_id.to_le_bytes()).unwrap();
+            manifest.write_all(&count.to_le_bytes()).unwrap();
+            manifest.write_all(&offset.to_le_bytes()).unwrap();
+            manifest.write_all(&threshold.to_le_bytes()).unwrap();
+            manifest.write_all(&checksum.to_le_bytes()).unwrap();
+            manifest.write_all(&0_u32.to_le_bytes()).unwrap();
+        }
+
+        let mut chunk_starts: Vec<u64> = chunk_buffers.keys().copied().collect();
+        chunk_starts.sort_unstable();
+        for start in chunk_starts {
+            let path = self.chunk_file_path(start);
+            let mut f = File::create(path).expect("Gagal menulis chunk file");
+            if let Some(buf) = chunk_buffers.get(&start) {
+                f.write_all(buf).unwrap();
+            }
+        }
+
+        for (node_id, count, offset, threshold, checksum) in records {
+            if let Some(meta) = self.node_index.get_mut(&node_id) {
+                meta.synapse_count = count;
+                meta.synapse_offset = offset;
+                meta.threshold = threshold;
+                meta.checksum = checksum;
+            }
+        }
+    }
+
+    fn maybe_migrate_legacy_base_to_chunks(&mut self) {
+        if self.node_index.is_empty() || self.has_chunk_files() {
+            return;
+        }
+
+        let mut has_legacy_offsets = false;
+        for meta in self.node_index.values() {
+            if meta.synapse_count > 0
+                && meta.synapse_offset != u64::MAX
+                && !Self::is_chunk_offset(meta.synapse_offset)
+            {
+                has_legacy_offsets = true;
+                break;
+            }
+        }
+        if !has_legacy_offsets {
+            return;
+        }
+
+        let mut node_ids: Vec<u64> = self.node_index.keys().copied().collect();
+        node_ids.sort_unstable();
+        let mut all_data: Vec<(u64, Vec<Synapse>)> = Vec::with_capacity(node_ids.len());
+        for node_id in node_ids {
+            all_data.push((node_id, self.load_from_base(node_id)));
+        }
+        self.write_base_manifest_and_chunks(&all_data);
+        println!("[Migrasi] base.bin lama dimigrasikan ke chunk range");
+    }
+    fn rebuild_base_bin(&mut self) {
+        let node_ids: Vec<u64> = self.node_index.keys().copied().collect();
+        let mut all_data: Vec<(u64, Vec<Synapse>)> = Vec::new();
+
+        for node_id in &node_ids {
+            let mut merged = self.load_from_base(*node_id);
+            if let Some(delta) = self.delta_index.get(node_id) {
+                for (receiver, (weight, _)) in delta {
+                    if let Some(existing) = merged.iter_mut().find(|s| s.receiver_id == *receiver) {
+                        existing.weight = *weight;
+                    } else {
+                        merged.push(Synapse {
+                            receiver_id: *receiver,
+                            weight: *weight,
+                        });
+                    }
+                }
+            }
+
+            if !merged.is_empty() {
+                let avg = merged.iter().map(|s| s.weight).sum::<f32>() / merged.len() as f32;
+                let threshold = avg * PRUNE_RATIO;
+                merged.retain(|s| s.weight >= threshold);
+                merged.sort_by(|a, b| b.weight.partial_cmp(&a.weight).unwrap_or(std::cmp::Ordering::Equal));
+            }
+
+            all_data.push((*node_id, merged));
+        }
+
+        all_data.sort_by_key(|(node_id, _)| *node_id);
+        self.write_base_manifest_and_chunks(&all_data);
+    }
+
+    fn reset_delta_file(&self) {
+        let mut f = File::create(&self.delta_path).expect("Gagal reset delta.bin");
+        f.write_all(&MAGIC_DELTA.to_le_bytes()).unwrap();
+        f.write_all(&VERSION.to_le_bytes()).unwrap();
+        f.write_all(&0_u16.to_le_bytes()).unwrap();
+    }
 }
 
 #[pymethods]
-impl CtnEngine {
+impl RagpEngine {
     #[new]
     fn new(storage_dir: String) -> Self {
-        let path = PathBuf::from(storage_dir);
-        // Buat folder jika belum ada
+        let path = PathBuf::from(&storage_dir);
         if !path.exists() {
-            fs::create_dir_all(&path).expect("Gagal membuat direktori storage CTN");
+            std::fs::create_dir_all(&path).expect("Gagal membuat direktori storage");
         }
 
-        CtnEngine {
-            storage_path: path,
-            index: BTreeMap::new(),
-            loaded_chunks: HashMap::new(),
+        let base_path = path.join("base.bin");
+        let delta_path = path.join("delta.bin");
+        let capacity = NonZeroUsize::new(LRU_CAPACITY).unwrap();
+
+        let mut engine = RagpEngine {
+            storage_dir: path.clone(),
+            base_path,
+            delta_path,
+            node_index: HashMap::new(),
+            delta_index: HashMap::new(),
+            activation: HashMap::new(),
+            temporal_window: VecDeque::new(),
+            tick: 0,
+            base_cache: LruCache::new(capacity),
+            pinned_cache: HashMap::new(),
+            pinned_set: HashSet::new(),
+            access_count: HashMap::new(),
+            access_since_recompute: 0,
+            cache_policy: Self::env_policy("RAGP_CACHE_POLICY", DEFAULT_CACHE_POLICY),
+            cache_ram_fraction: Self::env_f32("RAGP_CACHE_RAM_FRACTION", DEFAULT_CACHE_RAM_FRACTION),
+            cache_ram_min_mb: Self::env_u64("RAGP_CACHE_RAM_MIN_MB", DEFAULT_CACHE_RAM_MIN_MB),
+            cache_ram_max_mb: Self::env_u64("RAGP_CACHE_RAM_MAX_MB", DEFAULT_CACHE_RAM_MAX_MB),
+            cache_pin_fraction: Self::env_f32("RAGP_CACHE_PIN_FRACTION", DEFAULT_CACHE_PIN_FRACTION),
+            cache_budget_bytes: 0,
+            pinned_budget_bytes: 0,
+            lru_budget_bytes: 0,
+            cache_bytes_est: 0,
+            pinned_bytes_est: 0,
+            lru_bytes_est: 0,
+        };
+
+        engine.load_node_index();
+        engine.maybe_migrate_legacy_base_to_chunks();
+        engine.load_node_index();
+        engine.init_delta_if_needed();
+        engine.load_delta_index();
+        engine.refresh_cache_budget();
+        engine.recompute_pinned_set(true);
+        engine
+    }
+    fn init_node_pool(&mut self, node_ids: Vec<u64>) {
+        self.node_index.clear();
+        self.delta_index.clear();
+        self.activation.clear();
+        self.temporal_window.clear();
+        self.base_cache.clear();
+        self.pinned_cache.clear();
+        self.pinned_set.clear();
+        self.access_count.clear();
+        self.access_since_recompute = 0;
+        self.tick = 0;
+        self.clear_chunk_files();
+
+        let mut sorted_ids = node_ids;
+        sorted_ids.sort_unstable();
+        sorted_ids.dedup();
+
+        for id in &sorted_ids {
+            self.node_index.insert(
+                *id,
+                NodeMeta {
+                    node_id: *id,
+                    synapse_count: 0,
+                    synapse_offset: u64::MAX,
+                    threshold: DEFAULT_THRESHOLD,
+                    checksum: 0,
+                },
+            );
         }
+
+        let all_data: Vec<(u64, Vec<Synapse>)> = sorted_ids
+            .iter()
+            .map(|id| (*id, Vec::new()))
+            .collect();
+        self.write_base_manifest_and_chunks(&all_data);
+
+        self.reset_delta_file();
+        self.refresh_cache_budget();
+        self.recompute_pinned_set(true);
+
+        println!("[RagpEngine] {} node diinisialisasi (tanpa sinapsis)", self.node_index.len());
     }
 
-    /// Menyimpan Chunk Data CTN baru ke Hardisk & Meng-update B-Tree Index
-    fn write_chunk(&mut self, chunk_id: String, ctn_data: String) {
-        // 1. Tulis fisik SSD
-        let file_path = self.storage_path.join(format!("{}.ctn", chunk_id));
-        fs::write(&file_path, &ctn_data).expect("Gagal menge-save file CTN ke hardisk");
+    fn get_connections(&mut self, sender: u64) -> Vec<(u64, f32)> {
+        if !self.node_index.contains_key(&sender) {
+            return Vec::new();
+        }
 
-        // 2. Parsel String untuk mencari ID unik yang ada di chunk ini
-        // Format CTN: "pengirim,penerima,weight|..."
-        for triplet in ctn_data.split('|') {
-            let parts: Vec<&str> = triplet.split(',').collect();
-            if parts.len() == 3 {
-                // Konversi pengirim ke angka (u64)
-                if let Ok(sender_id) = parts[0].parse::<u64>() {
-                    // Masukkan ke B-Tree Index: "Jika cari ID ini, buka file chunk_id"
-                    self.index.insert(sender_id, chunk_id.clone());
+        self.record_access(sender);
+        let base_synapses = self.get_cached_or_load_base(sender);
+
+        let mut merged: HashMap<u64, f32> = HashMap::new();
+        for s in base_synapses {
+            merged.insert(s.receiver_id, s.weight);
+        }
+        if let Some(delta) = self.delta_index.get(&sender) {
+            for (receiver, (weight, _)) in delta {
+                merged.insert(*receiver, *weight);
+            }
+        }
+        merged.into_iter().collect()
+    }
+
+    fn spread_activation(&mut self, seed_node: u64, seed_strength: f32) {
+        self.activation.clear();
+        self.activation.insert(seed_node, seed_strength);
+        self.temporal_window.push_back((seed_node, seed_strength, self.tick));
+        if self.temporal_window.len() > TEMPORAL_WINDOW_SIZE {
+            self.temporal_window.pop_front();
+        }
+
+        let mut queue: VecDeque<(u64, f32, u8)> = VecDeque::new();
+        queue.push_back((seed_node, seed_strength, 0));
+
+        while let Some((node, strength, depth)) = queue.pop_front() {
+            if depth >= MAX_SPREAD_DEPTH {
+                continue;
+            }
+
+            let connections = self.get_connections(node);
+            for (receiver, weight) in connections {
+                let incoming = strength * weight;
+                let threshold = self
+                    .node_index
+                    .get(&receiver)
+                    .map_or(DEFAULT_THRESHOLD, |m| m.threshold);
+                if incoming < threshold {
+                    continue;
                 }
-            }
-        }
 
-        // 3. (Opsional) Langsung load ke RAM setelah kutulis
-        self.loaded_chunks.insert(chunk_id, ctn_data);
-    }
-
-    /// (Internal) Membaca Chunk spesifik dari Hardisk ke RAM
-    fn load_chunk_by_id(&mut self, chunk_id: &str) -> bool {
-        let file_path = self.storage_path.join(format!("{}.ctn", chunk_id));
-        if let Ok(content) = fs::read_to_string(file_path) {
-            self.loaded_chunks.insert(chunk_id.to_string(), content);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// SMART QUERY ROUTING (B-TREE SEARCH + LAZY LOADING)
-    /// Mencari pengirim dengan cepat dengan melihat Peta B-Tree terlebih dahulu
-    fn get_connections(&mut self, sender_id_str: &str) -> Vec<(String, f64)> {
-        let mut results = Vec::new();
-
-        // 1. Konversi text input ke Angka untuk pencarian B-Tree
-        let sender_id: u64 = match sender_id_str.parse() {
-            Ok(val) => val,
-            Err(_) => return results, // Invalid ID
-        };
-
-        // 2. Cari di Peta B-Tree (O(log n) speed)
-        // Di file mana si `sender_id` ini berada?
-        let target_chunk = match self.index.get(&sender_id) {
-            Some(chunk_name) => chunk_name.clone(),
-            None => {
-                // Tidak ada di dalam Index.
-                return results;
-            }
-        };
-
-        // 3. Lazy Loading - Cek apakah file ini sudah ada di Working Memory (RAM)?
-        if !self.loaded_chunks.contains_key(&target_chunk) {
-            // Belum ada! Berarti harus panggil petugas untuk ambil di Hardisk.
-            self.load_chunk_by_id(&target_chunk);
-        }
-
-        // 4. Ekstrak data substring secara brutal O(N) PADA CHUNK SPESIFIK SAJA
-        if let Some(data) = self.loaded_chunks.get(&target_chunk) {
-            let search_prefix = format!("{},", sender_id_str);
-            for triplet in data.split('|') {
-                if triplet.starts_with(&search_prefix) {
-                    let parts: Vec<&str> = triplet.split(',').collect();
-                    if parts.len() == 3 {
-                        let receiver = parts[1].to_string();
-                        if let Ok(weight) = parts[2].parse::<f64>() {
-                            results.push((receiver, weight));
-                        }
+                let current = self.activation.get(&receiver).copied().unwrap_or(0.0);
+                if incoming > current {
+                    self.activation.insert(receiver, incoming);
+                    self.temporal_window.push_back((receiver, incoming, self.tick));
+                    if self.temporal_window.len() > TEMPORAL_WINDOW_SIZE {
+                        self.temporal_window.pop_front();
                     }
+                    queue.push_back((receiver, incoming, depth.saturating_add(1)));
                 }
             }
         }
 
-        results
+        self.tick = self.tick.saturating_add(1);
     }
 
-    /// TAHAP 9: COMPETITION DEGREE (BASAL GANGLIA)
-    /// Menghitung Cd = (value × opportunity) / cost untuk setiap aksi
-    /// dari stimulus tertentu, dengan mempertimbangkan konteks aktif.
-    /// Return: Vec<(aksi_id, Cd)> diurutkan dari Cd tertinggi.
-    fn compute_cd(&mut self, stimulus: &str, context: Vec<String>) -> Vec<(String, f64)> {
-        let mut cd_results: Vec<(String, f64)> = Vec::new();
+    fn get_active_nodes(&self) -> Vec<(u64, f32)> {
+        let mut out: Vec<(u64, f32)> = self.activation.iter().map(|(k, v)| (*k, *v)).collect();
+        out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        out
+    }
 
-        // 1. Ambil semua aksi dari stimulus (value)
+    fn compute_cd(&mut self, stimulus: u64, context: Vec<u64>) -> Vec<(u64, f64)> {
         let actions = self.get_connections(stimulus);
         if actions.is_empty() {
-            return cd_results;
+            return Vec::new();
         }
 
+        let mut out: Vec<(u64, f64)> = Vec::new();
         for (action_id, value) in &actions {
-
-            // 2. Ambil cost: aksi → resource node (ambil weight tertinggi)
-            let cost_connections = self.get_connections(action_id);
-            let cost = if cost_connections.is_empty() {
-                1.0 // Tidak ada data cost = asumsikan maksimal (paling mahal)
+            let cost_conns = self.get_connections(*action_id);
+            let cost = if cost_conns.is_empty() {
+                1.0_f64
             } else {
-                let total: f64 = cost_connections.iter().map(|(_, w)| w).sum();
-                total / cost_connections.len() as f64
+                let total: f32 = cost_conns.iter().map(|(_, w)| *w).sum();
+                (total / cost_conns.len() as f32) as f64
             };
 
-            // 3. Ambil opportunity: context → aksi (rata-rata dari semua konteks aktif)
             let mut opp_weights: Vec<f64> = Vec::new();
             for ctx in &context {
-                let ctx_connections = self.get_connections(ctx);
-                for (target, w) in &ctx_connections {
-                    if target == action_id {
-                        opp_weights.push(*w);
+                for (target, w) in self.get_connections(*ctx) {
+                    if target == *action_id {
+                        opp_weights.push(w as f64);
                     }
                 }
             }
+
             let opportunity = if opp_weights.is_empty() {
-                0.5 // Tidak ada data opportunity = netral
+                0.5
             } else {
                 opp_weights.iter().sum::<f64>() / opp_weights.len() as f64
             };
 
-            // 4. Hitung Cd
             let cd = if cost == 0.0 {
-                f64::MAX // Cost nol = gratis = Cd tak terhingga
+                f64::MAX
             } else {
-                (value * opportunity) / cost
+                (*value as f64 * opportunity) / cost
             };
-
-            cd_results.push((action_id.clone(), cd));
+            out.push((*action_id, cd));
         }
 
-        // 5. Urutkan dari Cd tertinggi (pemenang kompetisi)
-        cd_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        out
+    }
+    fn form_synapses_from_window(&mut self) -> u32 {
+        let nodes: Vec<(u64, f32)> = self
+            .temporal_window
+            .iter()
+            .map(|(node_id, strength, _)| (*node_id, *strength))
+            .collect();
 
-        cd_results
+        let mut formed = 0_u32;
+        for i in 0..nodes.len() {
+            let (sender, s_strength) = nodes[i];
+            if !self.node_index.contains_key(&sender) {
+                continue;
+            }
+
+            let sender_thr = self
+                .node_index
+                .get(&sender)
+                .map_or(DEFAULT_THRESHOLD, |m| m.threshold);
+            if s_strength < sender_thr {
+                continue;
+            }
+            if self.synapse_count_for(sender) >= MAX_SYNAPSES_PER_NODE {
+                continue;
+            }
+
+            for j in 0..nodes.len() {
+                if i == j {
+                    continue;
+                }
+
+                let (receiver, r_strength) = nodes[j];
+                if !self.node_index.contains_key(&receiver) {
+                    continue;
+                }
+
+                let prob = s_strength * r_strength;
+                if rand_f32() > prob {
+                    continue;
+                }
+
+                let in_delta = self
+                    .delta_index
+                    .get(&sender)
+                    .map_or(false, |m| m.contains_key(&receiver));
+                if in_delta {
+                    continue;
+                }
+
+                let base_syn = self.get_cached_or_load_base(sender);
+                let in_base = base_syn.iter().any(|s| s.receiver_id == receiver);
+                if in_base {
+                    continue;
+                }
+
+                let ts = self.tick;
+                let entry = DeltaEntry {
+                    sender_id: sender,
+                    receiver_id: receiver,
+                    weight: INITIAL_WEIGHT,
+                    timestamp: ts,
+                };
+                self.append_delta_entry(&entry);
+                self.delta_index
+                    .entry(sender)
+                    .or_default()
+                    .insert(receiver, (INITIAL_WEIGHT, ts));
+                self.invalidate_sender_cache(sender);
+                formed = formed.saturating_add(1);
+            }
+        }
+
+        formed
     }
 
-    /// TAHAP 7: NEUROPLASTICITY (LONG-TERM POTENTIATION)
-    /// Mengubah bobot valensi dari memori yang sudah ada, atau menambahkan memori baru,
-    /// dan langsung me-rewrite ke Hardisk.
-    fn update_weight(&mut self, sender_id_str: &str, receiver_id_str: &str, new_weight: f64) {
-        // Coba parsing ke u64
-        let sender_id: u64 = match sender_id_str.parse() {
-            Ok(v) => v,
-            Err(_) => return, // Invalid ID
-        };
-
-        // Cari tahu di mana chunk-nya
-        let target_chunk = match self.index.get(&sender_id) {
-            Some(chunk) => chunk.clone(),
-            None => {
-                // Skenario pembuatan memori super baru (belum kita support sepenuhnya di prototype ini
-                // tanpa mekanisme alokasi nama file otomatis). Abaikan dulu.
-                return;
-            }
-        };
-
-        // Pastikan load ke RAM
-        if !self.loaded_chunks.contains_key(&target_chunk) {
-            if !self.load_chunk_by_id(&target_chunk) {
-                return; // gagal load
-            }
+    fn update_weight(&mut self, sender: u64, receiver: u64, new_weight: f32) {
+        if !self.node_index.contains_key(&sender) || !self.node_index.contains_key(&receiver) {
+            return;
         }
 
-        let mut updated_ctn_string = String::new();
-        let mut modified = false;
+        let weight = new_weight.max(0.0).min(1.0);
+        let ts = self.tick;
+        self.tick = self.tick.saturating_add(1);
 
-        // Modifikasi string panjang di RAM
-        if let Some(ctn_data) = self.loaded_chunks.get(&target_chunk) {
-            let mut new_triplets = Vec::new();
-            let target_prefix = format!("{},{},", sender_id_str, receiver_id_str);
+        self.delta_index
+            .entry(sender)
+            .or_default()
+            .insert(receiver, (weight, ts));
 
-            for triplet in ctn_data.split('|') {
-                if triplet.starts_with(&target_prefix) {
-                    // Update yang sudah ada
-                    new_triplets.push(format!(
-                        "{},{},{}",
-                        sender_id_str, receiver_id_str, new_weight
-                    ));
-                    modified = true;
-                } else {
-                    // Pertahankan yang sudah ada
-                    new_triplets.push(triplet.to_string());
+        let entry = DeltaEntry {
+            sender_id: sender,
+            receiver_id: receiver,
+            weight,
+            timestamp: ts,
+        };
+        self.append_delta_entry(&entry);
+        self.invalidate_sender_cache(sender);
+    }
+
+    fn consolidate(&mut self) -> (u32, u32) {
+        let mut merged = 0_u32;
+        let mut pruned = 0_u32;
+
+        let senders: Vec<u64> = self.delta_index.keys().copied().collect();
+        for sender in &senders {
+            let mut synapses = self.load_from_base(*sender);
+            if let Some(delta) = self.delta_index.get(sender) {
+                for (receiver, (weight, _)) in delta {
+                    if let Some(existing) = synapses.iter_mut().find(|s| s.receiver_id == *receiver) {
+                        existing.weight = *weight;
+                    } else {
+                        synapses.push(Synapse {
+                            receiver_id: *receiver,
+                            weight: *weight,
+                        });
+                    }
+                    merged = merged.saturating_add(1);
                 }
             }
 
-            // Jika relasi ini belum pernah ada (tapi ID sedernya ada di file ini), tambahkan ke ekor
-            if !modified {
-                new_triplets.push(format!(
-                    "{},{},{}",
-                    sender_id_str, receiver_id_str, new_weight
-                ));
+            if !synapses.is_empty() {
+                let avg = synapses.iter().map(|s| s.weight).sum::<f32>() / synapses.len() as f32;
+                let threshold = avg * PRUNE_RATIO;
+                let before = synapses.len();
+                synapses.retain(|s| s.weight >= threshold);
+                synapses.sort_by(|a, b| b.weight.partial_cmp(&a.weight).unwrap_or(std::cmp::Ordering::Equal));
+                pruned = pruned.saturating_add((before - synapses.len()) as u32);
             }
 
-            updated_ctn_string = new_triplets.join("|");
+            if let Some(meta) = self.node_index.get_mut(sender) {
+                meta.synapse_count = synapses.len() as u32;
+            }
         }
 
-        // Tulis (Rewrite) kembali ke Hardisko & RAM
-        if !updated_ctn_string.is_empty() {
-            let file_path = self.storage_path.join(format!("{}.ctn", target_chunk));
-            fs::write(&file_path, &updated_ctn_string).expect("Gagal menulis ulang file CTN");
-            self.loaded_chunks.insert(target_chunk, updated_ctn_string);
-        }
+        self.rebuild_base_bin();
+        self.delta_index.clear();
+        self.reset_delta_file();
+        self.temporal_window.clear();
+        self.activation.clear();
+
+        // Keep only refreshed pinned hotset after major merge/prune.
+        self.base_cache.clear();
+        self.pinned_cache.clear();
+        self.refresh_cache_budget();
+        self.recompute_pinned_set(true);
+
+        println!("[Konsolidasi] merged={} pruned={}", merged, pruned);
+        (merged, pruned)
     }
+
+    fn status(&self) -> String {
+        let delta_total: usize = self.delta_index.values().map(|m| m.len()).sum();
+        let budget_mb = self.cache_budget_bytes as f64 / (1024.0 * 1024.0);
+        let cache_mb = self.cache_bytes_est as f64 / (1024.0 * 1024.0);
+        let chunk_count = self.chunk_file_starts().len();
+
+        format!(
+            "Nodes={} | Chunks={} | Delta nodes={} entries={} | Active={} | Tick={} | pinned_nodes={} | lru_nodes={} | cache_budget_mb={:.1} | cache_bytes_est_mb={:.1}",
+            self.node_index.len(),
+            chunk_count,
+            self.delta_index.len(),
+            delta_total,
+            self.activation.len(),
+            self.tick,
+            self.pinned_cache.len(),
+            self.base_cache.len(),
+            budget_mb,
+            cache_mb
+        )
+    }
+
+    fn get_activation(&self) -> Vec<(u64, f32)> {
+        let mut out: Vec<(u64, f32)> = self.activation.iter().map(|(k, v)| (*k, *v)).collect();
+        out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        out
+    }
+}
+
+fn rand_f32() -> f32 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    let mixed = nanos.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+    (mixed as f32) / (u32::MAX as f32)
 }
 
 #[pymodule]
 fn ctn_engine(_py: Python, m: &PyModule) -> PyResult<()> {
-    m.add_class::<CtnEngine>()?;
+    m.add_class::<RagpEngine>()?;
     Ok(())
 }
