@@ -25,9 +25,10 @@ ragp_storage/
 Startup behavior:
 1. Load `base.bin` node index.
 2. If legacy monolithic base is detected, migrate automatically to chunk files.
-3. Ensure `delta.bin` exists.
-4. Replay `delta.bin` entries with CRC32 validation into `delta_index`.
-5. Continue from latest timestamp (`tick`).
+3. Validate/auto-migrate innate registry via `ensure_innate_registry(node_ids)`.
+4. Ensure `delta.bin` exists.
+5. Replay `delta.bin` entries with CRC32 validation into `delta_index`.
+6. Continue from latest timestamp (`tick`).
 
 `delta.bin` is reset after every `consolidate()`.
 
@@ -59,8 +60,9 @@ Cache policy:
 
 Main path:
 1. `main.py` parses startup mode.
-2. On first init: create 109-node pool, seed basic instinct links.
-3. On resume: continue existing storage.
+2. `main.py` always calls `ensure_innate_registry()` to keep innate node set in sync.
+3. On first init: seed basic instinct links.
+4. On resume: continue existing storage.
 4. `run_survival_loop()` in `ragp_loop.py` drives perception-action-learning cycle.
 
 Loop highlights:
@@ -85,6 +87,11 @@ Cache controls:
 - `RAGP_CACHE_RAM_MIN_MB` (default `256`)
 - `RAGP_CACHE_RAM_MAX_MB` (default `1536`)
 - `RAGP_CACHE_PIN_FRACTION` (default `0.35`)
+
+Innate registry controls:
+- `RAGP_INNATE_REGISTRY_VERSION` (default `1`)
+- Unknown node policy: hard reject (`ValueError`) for `get_connections`, `spread_activation`, `compute_cd`, `update_weight`.
+- Registry change policy: auto migrate (`base+delta` preserved where node IDs still valid, invalid links pruned).
 
 ---
 

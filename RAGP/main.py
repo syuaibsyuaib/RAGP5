@@ -17,6 +17,7 @@ except ImportError:
 
 STORAGE_DIR = os.path.join(os.getcwd(), "ragp_storage")
 NODE_POOL_FULL = list(range(1, 110))
+INNATE_REGISTRY_VERSION = 1
 
 DEFAULT_MAX_STEPS = 100
 DEFAULT_SEED = 42
@@ -91,7 +92,12 @@ def consolidate_hippocampus(engine: RagpEngine, buffer: dict, verbose: bool = Tr
         if abs(entry["peak"]) <= mean_signal:
             continue
 
-        old_weight = dict(engine.get_connections(sender)).get(receiver, 0.5)
+        try:
+            old_weight = dict(engine.get_connections(sender)).get(receiver, 0.5)
+        except ValueError as exc:
+            if verbose:
+                print(f"  [Skip] {exc}")
+            continue
         new_weight = rescorla_wagner(old_weight, entry["acc"], entry["count"])
         engine.update_weight(sender, receiver, new_weight)
         consolidated += 1
@@ -118,6 +124,7 @@ def build_konsolidasi_fn():
 
 
 def main():
+    os.environ.setdefault("RAGP_INNATE_REGISTRY_VERSION", str(INNATE_REGISTRY_VERSION))
     reset_requested = should_reset(sys.argv[1:])
     if reset_requested and os.path.exists(STORAGE_DIR):
         shutil.rmtree(STORAGE_DIR)
@@ -125,9 +132,10 @@ def main():
 
     first_init = not base_file_exists(STORAGE_DIR)
     engine = RagpEngine(STORAGE_DIR)
+    migration_status = engine.ensure_innate_registry(NODE_POOL_FULL)
+    print(f"[Registry] {migration_status}")
 
     if first_init:
-        engine.init_node_pool(NODE_POOL_FULL)
         print(f"[Init] Node pool dibuat. {engine.status()}")
         seed_initial_knowledge(engine)
     else:

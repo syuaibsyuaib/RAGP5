@@ -1,4 +1,5 @@
 ﻿
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
@@ -36,6 +37,7 @@ const DEFAULT_CACHE_RAM_FRACTION: f32 = 0.25;
 const DEFAULT_CACHE_RAM_MIN_MB: u64 = 256;
 const DEFAULT_CACHE_RAM_MAX_MB: u64 = 1536;
 const DEFAULT_CACHE_PIN_FRACTION: f32 = 0.35;
+const DEFAULT_INNATE_REGISTRY_VERSION: u32 = 1;
 
 #[derive(Clone, Debug)]
 struct NodeMeta {
@@ -92,6 +94,8 @@ struct RagpEngine {
     cache_bytes_est: u64,
     pinned_bytes_est: u64,
     lru_bytes_est: u64,
+    registry_version: u32,
+    loaded_registry_version: u32,
 }
 
 impl RagpEngine {
@@ -110,6 +114,13 @@ impl RagpEngine {
         env::var(key)
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(default)
+    }
+
+    fn env_u32(key: &str, default: u32) -> u32 {
+        env::var(key)
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(default)
     }
 
@@ -422,6 +433,7 @@ impl RagpEngine {
     }
     fn load_node_index(&mut self) {
         self.node_index.clear();
+        self.loaded_registry_version = DEFAULT_INNATE_REGISTRY_VERSION;
         let mut f = match File::open(&self.base_path) {
             Ok(file) => file,
             Err(_) => return,
@@ -435,6 +447,14 @@ impl RagpEngine {
         let magic = u32::from_le_bytes(header[0..4].try_into().unwrap());
         if magic != MAGIC_BASE {
             return;
+        }
+        let version = u16::from_le_bytes(header[4..6].try_into().unwrap());
+        if version != VERSION {
+            return;
+        }
+        let reg = u32::from_le_bytes(header[10..14].try_into().unwrap());
+        if reg > 0 {
+            self.loaded_registry_version = reg;
         }
 
         let node_count = u32::from_le_bytes(header[6..10].try_into().unwrap());
@@ -477,6 +497,10 @@ impl RagpEngine {
         }
         let version = u16::from_le_bytes(header[4..6].try_into().unwrap());
         if version != VERSION {
+            return;
+        }
+        let delta_registry_version = u16::from_le_bytes(header[6..8].try_into().unwrap()) as u32;
+        if delta_registry_version != self.registry_version {
             return;
         }
 
@@ -600,7 +624,8 @@ impl RagpEngine {
         let mut f = File::create(&self.delta_path).expect("Gagal membuat delta.bin");
         f.write_all(&MAGIC_DELTA.to_le_bytes()).unwrap();
         f.write_all(&VERSION.to_le_bytes()).unwrap();
-        f.write_all(&0_u16.to_le_bytes()).unwrap();
+        let reg = self.registry_version.min(u16::MAX as u32) as u16;
+        f.write_all(&reg.to_le_bytes()).unwrap();
     }
 
     fn synapse_count_for(&self, sender: u64) -> u32 {
@@ -652,7 +677,7 @@ impl RagpEngine {
         manifest.write_all(&MAGIC_BASE.to_le_bytes()).unwrap();
         manifest.write_all(&VERSION.to_le_bytes()).unwrap();
         manifest.write_all(&node_count.to_le_bytes()).unwrap();
-        manifest.write_all(&0_u32.to_le_bytes()).unwrap();
+        manifest.write_all(&self.registry_version.to_le_bytes()).unwrap();
         for (node_id, count, offset, threshold, checksum) in &records {
             manifest.write_all(&node_id.to_le_bytes()).unwrap();
             manifest.write_all(&count.to_le_bytes()).unwrap();
@@ -743,11 +768,143 @@ impl RagpEngine {
         self.write_base_manifest_and_chunks(&all_data);
     }
 
+    fn migrate_innate_registry(&mut self, node_ids: Vec<u64>) -> (u32, u32) {
+        let mut sorted_ids = node_ids;
+        sorted_ids.sort_unstable();
+        sorted_ids.dedup();
+        if sorted_ids.is_empty() {
+            return (0, 0);
+        }
+
+        if self.node_index.is_empty() {
+            self.init_node_pool(sorted_ids);
+            self.loaded_registry_version = self.registry_version;
+            return (0, 0);
+        }
+
+        let target_set: HashSet<u64> = sorted_ids.iter().copied().collect();
+        let old_ids: Vec<u64> = self.node_index.keys().copied().collect();
+        let old_set: HashSet<u64> = old_ids.iter().copied().collect();
+
+        let mut old_data: HashMap<u64, Vec<Synapse>> = HashMap::new();
+        for sender in &old_ids {
+            let mut merged = self.load_from_base(*sender);
+            if let Some(delta) = self.delta_index.get(sender) {
+                for (receiver, (weight, _)) in delta {
+                    if let Some(existing) = merged.iter_mut().find(|s| s.receiver_id == *receiver) {
+                        existing.weight = *weight;
+                    } else {
+                        merged.push(Synapse {
+                            receiver_id: *receiver,
+                            weight: *weight,
+                        });
+                    }
+                }
+            }
+            old_data.insert(*sender, merged);
+        }
+
+        self.node_index.clear();
+        for id in &sorted_ids {
+            self.node_index.insert(
+                *id,
+                NodeMeta {
+                    node_id: *id,
+                    synapse_count: 0,
+                    synapse_offset: u64::MAX,
+                    threshold: DEFAULT_THRESHOLD,
+                    checksum: 0,
+                },
+            );
+        }
+
+        let mut all_data: Vec<(u64, Vec<Synapse>)> = Vec::with_capacity(sorted_ids.len());
+        for id in &sorted_ids {
+            let mut syns = old_data.remove(id).unwrap_or_default();
+            syns.retain(|s| target_set.contains(&s.receiver_id));
+            syns.sort_by(|a, b| b.weight.partial_cmp(&a.weight).unwrap_or(std::cmp::Ordering::Equal));
+            all_data.push((*id, syns));
+        }
+        self.write_base_manifest_and_chunks(&all_data);
+
+        let removed_nodes = old_set.difference(&target_set).count() as u32;
+        let added_nodes = target_set.difference(&old_set).count() as u32;
+
+        self.delta_index.clear();
+        self.activation.clear();
+        self.temporal_window.clear();
+        self.base_cache.clear();
+        self.pinned_cache.clear();
+        self.pinned_set.clear();
+        self.access_count.clear();
+        self.access_since_recompute = 0;
+        self.reset_delta_file();
+        self.loaded_registry_version = self.registry_version;
+        self.refresh_cache_budget();
+        self.recompute_pinned_set(true);
+
+        (added_nodes, removed_nodes)
+    }
+
+    fn ensure_innate_registry_internal(&mut self, node_ids: Vec<u64>) -> (bool, u32, u32) {
+        let mut sorted_ids = node_ids;
+        sorted_ids.sort_unstable();
+        sorted_ids.dedup();
+        if sorted_ids.is_empty() {
+            return (false, 0, 0);
+        }
+
+        let mut current_ids: Vec<u64> = self.node_index.keys().copied().collect();
+        current_ids.sort_unstable();
+        let needs_migrate =
+            self.node_index.is_empty()
+                || self.loaded_registry_version != self.registry_version
+                || current_ids != sorted_ids;
+        if !needs_migrate {
+            return (false, 0, 0);
+        }
+
+        let (added, removed) = self.migrate_innate_registry(sorted_ids);
+        (true, added, removed)
+    }
+
+    fn strict_check_node(&self, node_id: u64, role: &str) -> PyResult<()> {
+        if self.node_index.contains_key(&node_id) {
+            Ok(())
+        } else {
+            Err(PyValueError::new_err(format!(
+                "Unknown node for {}: {}. Node must be registered in innate registry.",
+                role, node_id
+            )))
+        }
+    }
+
+    fn get_connections_internal(&mut self, sender: u64) -> Vec<(u64, f32)> {
+        if !self.node_index.contains_key(&sender) {
+            return Vec::new();
+        }
+
+        self.record_access(sender);
+        let base_synapses = self.get_cached_or_load_base(sender);
+
+        let mut merged: HashMap<u64, f32> = HashMap::new();
+        for s in base_synapses {
+            merged.insert(s.receiver_id, s.weight);
+        }
+        if let Some(delta) = self.delta_index.get(&sender) {
+            for (receiver, (weight, _)) in delta {
+                merged.insert(*receiver, *weight);
+            }
+        }
+        merged.into_iter().collect()
+    }
+
     fn reset_delta_file(&self) {
         let mut f = File::create(&self.delta_path).expect("Gagal reset delta.bin");
         f.write_all(&MAGIC_DELTA.to_le_bytes()).unwrap();
         f.write_all(&VERSION.to_le_bytes()).unwrap();
-        f.write_all(&0_u16.to_le_bytes()).unwrap();
+        let reg = self.registry_version.min(u16::MAX as u32) as u16;
+        f.write_all(&reg.to_le_bytes()).unwrap();
     }
 }
 
@@ -789,6 +946,11 @@ impl RagpEngine {
             cache_bytes_est: 0,
             pinned_bytes_est: 0,
             lru_bytes_est: 0,
+            registry_version: Self::env_u32(
+                "RAGP_INNATE_REGISTRY_VERSION",
+                DEFAULT_INNATE_REGISTRY_VERSION,
+            ),
+            loaded_registry_version: DEFAULT_INNATE_REGISTRY_VERSION,
         };
 
         engine.load_node_index();
@@ -843,27 +1005,28 @@ impl RagpEngine {
         println!("[RagpEngine] {} node diinisialisasi (tanpa sinapsis)", self.node_index.len());
     }
 
-    fn get_connections(&mut self, sender: u64) -> Vec<(u64, f32)> {
-        if !self.node_index.contains_key(&sender) {
-            return Vec::new();
+    fn ensure_innate_registry(&mut self, node_ids: Vec<u64>) -> String {
+        let (migrated, added, removed) = self.ensure_innate_registry_internal(node_ids);
+        if migrated {
+            format!(
+                "migrated=true registry_version={} added_nodes={} removed_nodes={}",
+                self.registry_version, added, removed
+            )
+        } else {
+            format!(
+                "migrated=false registry_version={} added_nodes=0 removed_nodes=0",
+                self.registry_version
+            )
         }
-
-        self.record_access(sender);
-        let base_synapses = self.get_cached_or_load_base(sender);
-
-        let mut merged: HashMap<u64, f32> = HashMap::new();
-        for s in base_synapses {
-            merged.insert(s.receiver_id, s.weight);
-        }
-        if let Some(delta) = self.delta_index.get(&sender) {
-            for (receiver, (weight, _)) in delta {
-                merged.insert(*receiver, *weight);
-            }
-        }
-        merged.into_iter().collect()
     }
 
-    fn spread_activation(&mut self, seed_node: u64, seed_strength: f32) {
+    fn get_connections(&mut self, sender: u64) -> PyResult<Vec<(u64, f32)>> {
+        self.strict_check_node(sender, "get_connections(sender)")?;
+        Ok(self.get_connections_internal(sender))
+    }
+
+    fn spread_activation(&mut self, seed_node: u64, seed_strength: f32) -> PyResult<()> {
+        self.strict_check_node(seed_node, "spread_activation(seed_node)")?;
         self.activation.clear();
         self.activation.insert(seed_node, seed_strength);
         self.temporal_window.push_back((seed_node, seed_strength, self.tick));
@@ -879,7 +1042,7 @@ impl RagpEngine {
                 continue;
             }
 
-            let connections = self.get_connections(node);
+            let connections = self.get_connections_internal(node);
             for (receiver, weight) in connections {
                 let incoming = strength * weight;
                 let threshold = self
@@ -903,6 +1066,7 @@ impl RagpEngine {
         }
 
         self.tick = self.tick.saturating_add(1);
+        Ok(())
     }
 
     fn get_active_nodes(&self) -> Vec<(u64, f32)> {
@@ -911,15 +1075,20 @@ impl RagpEngine {
         out
     }
 
-    fn compute_cd(&mut self, stimulus: u64, context: Vec<u64>) -> Vec<(u64, f64)> {
-        let actions = self.get_connections(stimulus);
+    fn compute_cd(&mut self, stimulus: u64, context: Vec<u64>) -> PyResult<Vec<(u64, f64)>> {
+        self.strict_check_node(stimulus, "compute_cd(stimulus)")?;
+        for ctx in &context {
+            self.strict_check_node(*ctx, "compute_cd(context)")?;
+        }
+
+        let actions = self.get_connections_internal(stimulus);
         if actions.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let mut out: Vec<(u64, f64)> = Vec::new();
         for (action_id, value) in &actions {
-            let cost_conns = self.get_connections(*action_id);
+            let cost_conns = self.get_connections_internal(*action_id);
             let cost = if cost_conns.is_empty() {
                 1.0_f64
             } else {
@@ -929,7 +1098,7 @@ impl RagpEngine {
 
             let mut opp_weights: Vec<f64> = Vec::new();
             for ctx in &context {
-                for (target, w) in self.get_connections(*ctx) {
+                for (target, w) in self.get_connections_internal(*ctx) {
                     if target == *action_id {
                         opp_weights.push(w as f64);
                     }
@@ -951,7 +1120,7 @@ impl RagpEngine {
         }
 
         out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        out
+        Ok(out)
     }
     fn form_synapses_from_window(&mut self) -> u32 {
         let nodes: Vec<(u64, f32)> = self
@@ -1027,10 +1196,9 @@ impl RagpEngine {
         formed
     }
 
-    fn update_weight(&mut self, sender: u64, receiver: u64, new_weight: f32) {
-        if !self.node_index.contains_key(&sender) || !self.node_index.contains_key(&receiver) {
-            return;
-        }
+    fn update_weight(&mut self, sender: u64, receiver: u64, new_weight: f32) -> PyResult<()> {
+        self.strict_check_node(sender, "update_weight(sender)")?;
+        self.strict_check_node(receiver, "update_weight(receiver)")?;
 
         let weight = new_weight.max(0.0).min(1.0);
         let ts = self.tick;
@@ -1049,6 +1217,7 @@ impl RagpEngine {
         };
         self.append_delta_entry(&entry);
         self.invalidate_sender_cache(sender);
+        Ok(())
     }
 
     fn consolidate(&mut self) -> (u32, u32) {
@@ -1109,13 +1278,14 @@ impl RagpEngine {
         let chunk_count = self.chunk_file_starts().len();
 
         format!(
-            "Nodes={} | Chunks={} | Delta nodes={} entries={} | Active={} | Tick={} | pinned_nodes={} | lru_nodes={} | cache_budget_mb={:.1} | cache_bytes_est_mb={:.1}",
+            "Nodes={} | Chunks={} | Delta nodes={} entries={} | Active={} | Tick={} | reg_ver={} | pinned_nodes={} | lru_nodes={} | cache_budget_mb={:.1} | cache_bytes_est_mb={:.1}",
             self.node_index.len(),
             chunk_count,
             self.delta_index.len(),
             delta_total,
             self.activation.len(),
             self.tick,
+            self.registry_version,
             self.pinned_cache.len(),
             self.base_cache.len(),
             budget_mb,
