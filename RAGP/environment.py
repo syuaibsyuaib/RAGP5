@@ -11,6 +11,9 @@
 
 import random
 import time
+import json
+import os
+from pathlib import Path
 
 # -----------------------------------------------------------------------------
 # SEMANTIC DICT (node ID → nama)
@@ -32,7 +35,57 @@ SENSOR_NODES = {
     "107": "MAKAN",
     "108": "ISTIRAHAT",
     "109": "TIDUR",
+    "110": "SENSOR_CO2_DISTRESS",
+    "111": "SENSOR_HAUS",
+    "112": "SENSOR_STRES_TERMAL",
+    "113": "SENSOR_STARTLE",
+    "114": "SENSOR_O2_RENDAH",
+    "120": "KONTEKS_SUARA_KERAS",
+    "121": "KONTEKS_PANAS_EKSTREM",
+    "122": "KONTEKS_DINGIN_EKSTREM",
+    "123": "KONTEKS_MULUT_KERING",
+    "124": "KONTEKS_NAPAS_BERAT",
+    "130": "AKSI_CARI_UDARA",
+    "131": "AKSI_CARI_MINUM",
+    "132": "AKSI_MENDINGIN",
+    "133": "AKSI_MENGHANGAT",
+    "134": "AKSI_FREEZE_ORIENT",
+    "135": "AKSI_MINTA_BANTUAN",
 }
+
+
+def _bootstrap_config_path() -> Path:
+    return Path(
+        os.environ.get(
+            "RAGP_BOOTSTRAP_CONFIG",
+            str(Path(__file__).with_name("ragp_bootstrap_config.json")),
+        )
+    )
+
+
+def _load_dynamic_semantics() -> dict[str, str]:
+    path = _bootstrap_config_path()
+    if not path.exists():
+        return {}
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return {}
+    if not isinstance(obj, dict):
+        return {}
+    raw = obj.get("node_semantics", {})
+    if not isinstance(raw, dict):
+        return {}
+
+    out: dict[str, str] = {}
+    for key, value in raw.items():
+        if value is None:
+            continue
+        out[str(key)] = str(value)
+    return out
+
+
+SENSOR_NODES.update(_load_dynamic_semantics())
 
 def translate(node_id) -> str:
     """Terima str atau int/u64, return nama semantik."""

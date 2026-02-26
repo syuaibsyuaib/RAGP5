@@ -10,6 +10,14 @@ PRIORITAS_STIMULUS = [104, 1, 103, 100]
 KONTEKS_NODES = {101, 102, 105}
 
 
+def _engine_async_on(engine) -> bool:
+    try:
+        metrics = engine.get_async_metrics()
+    except Exception:
+        return False
+    return bool(metrics.get("async_on", False))
+
+
 def run_survival_loop(
     engine,
     hippocampus: dict,
@@ -36,8 +44,13 @@ def run_survival_loop(
         # Environment provides string sensor IDs; convert to int for Rust engine.
         sensors = [int(s) for s in env.get_active_sensors()]
 
-        for sensor in sensors:
-            engine.spread_activation(sensor, 1.0)
+        if _engine_async_on(engine):
+            batch = [(int(sensor), 1.0, "survival_loop") for sensor in sensors]
+            if batch:
+                engine.submit_stimuli(batch)
+        else:
+            for sensor in sensors:
+                engine.spread_activation(sensor, 1.0)
 
         stimulus, context = _parse_sensors(sensors)
         if stimulus is None:

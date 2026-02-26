@@ -1,15 +1,20 @@
 ﻿
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::{PyAny, PyDict};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use lru::LruCache;
 use sysinfo::System;
+use tokio::runtime::{Builder as TokioRuntimeBuilder, Runtime as TokioRuntime};
+use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
 
 const MAGIC_BASE: u32 = 0x5241_4750; // "RAGP"
 const MAGIC_DELTA: u32 = 0x4445_4C54; // "DELT"
@@ -38,6 +43,37 @@ const DEFAULT_CACHE_RAM_MIN_MB: u64 = 256;
 const DEFAULT_CACHE_RAM_MAX_MB: u64 = 1536;
 const DEFAULT_CACHE_PIN_FRACTION: f32 = 0.35;
 const DEFAULT_INNATE_REGISTRY_VERSION: u32 = 1;
+const DEFAULT_ASYNC_RAM_WARN_MB: u64 = 1024;
+const DEFAULT_ASYNC_RAM_CRITICAL_MB: u64 = 1536;
+const DEFAULT_ASYNC_COALESCE_WINDOW_MS: u64 = 300;
+const DEFAULT_ASYNC_WRITE_THROTTLE_PER_SEC: u32 = 5000;
+
+#[derive(Clone, Debug)]
+struct AsyncPolicy {
+    ram_warn_mb: u64,
+    ram_critical_mb: u64,
+    coalesce_window_ms: u64,
+    write_throttle_per_sec: u32,
+}
+
+#[derive(Clone, Debug)]
+struct AsyncRuntimeState {
+    enabled: bool,
+    ingress_paused: bool,
+    shard_count: usize,
+    global_queue_len: u64,
+    dropped_total: u64,
+    coalesced_total: u64,
+    hop_total: u64,
+    processed_total: u64,
+    processed_per_sec: f64,
+    last_rate_ts_ms: u64,
+    last_rate_processed_total: u64,
+    guard_mode: String,
+    per_shard_queue_len: Vec<u64>,
+    per_shard_processed: Vec<u64>,
+    policy: AsyncPolicy,
+}
 
 #[derive(Clone, Debug)]
 struct NodeMeta {
@@ -52,6 +88,65 @@ struct NodeMeta {
 struct Synapse {
     receiver_id: u64,
     weight: f32,
+}
+
+#[derive(Clone, Debug)]
+struct AsyncSynapse {
+    receiver_id: u64,
+    weight: f32,
+}
+
+#[derive(Debug)]
+struct AsyncShared {
+    shard_count: usize,
+    adjacency: HashMap<u64, Vec<AsyncSynapse>>,
+    threshold: HashMap<u64, f32>,
+    activation: HashMap<u64, f32>,
+    ingress_paused: bool,
+    global_queue_len: u64,
+    per_shard_queue_len: Vec<u64>,
+    processed_total: u64,
+    processed_per_sec: f64,
+    last_rate_ts_ms: u64,
+    last_rate_processed_total: u64,
+    dropped_total: u64,
+    coalesced_total: u64,
+    hop_total: u64,
+    guard_mode: String,
+    per_shard_processed: Vec<u64>,
+}
+
+enum ShardCommand {
+    Stimulus {
+        node_id: u64,
+        strength: f32,
+        source: String,
+        origin_tick: u64,
+        reply: oneshot::Sender<bool>,
+    },
+    Hop {
+        node_id: u64,
+        strength: f32,
+        origin_tick: u64,
+        source_shard: usize,
+    },
+    UpdateEdge {
+        sender: u64,
+        receiver: u64,
+        weight: f32,
+        reply: oneshot::Sender<bool>,
+    },
+    Flush {
+        reply: oneshot::Sender<()>,
+    },
+    Stop,
+}
+
+struct AsyncActorRuntime {
+    rt: TokioRuntime,
+    shard_txs: Vec<mpsc::UnboundedSender<ShardCommand>>,
+    shared: Arc<TokioMutex<AsyncShared>>,
+    global_tick: Arc<AtomicU64>,
 }
 
 #[derive(Clone, Debug)]
@@ -96,6 +191,8 @@ struct RagpEngine {
     lru_bytes_est: u64,
     registry_version: u32,
     loaded_registry_version: u32,
+    async_state: AsyncRuntimeState,
+    async_runtime: Option<AsyncActorRuntime>,
 }
 
 impl RagpEngine {
@@ -122,6 +219,144 @@ impl RagpEngine {
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(default)
+    }
+
+    fn default_shard_count() -> usize {
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let half = (cpus / 2).max(2);
+        half
+    }
+
+    fn default_async_state() -> AsyncRuntimeState {
+        AsyncRuntimeState {
+            enabled: false,
+            ingress_paused: false,
+            shard_count: Self::default_shard_count(),
+            global_queue_len: 0,
+            dropped_total: 0,
+            coalesced_total: 0,
+            hop_total: 0,
+            processed_total: 0,
+            processed_per_sec: 0.0,
+            last_rate_ts_ms: 0,
+            last_rate_processed_total: 0,
+            guard_mode: "normal".to_string(),
+            per_shard_queue_len: vec![0; Self::default_shard_count()],
+            per_shard_processed: vec![0; Self::default_shard_count()],
+            policy: AsyncPolicy {
+                ram_warn_mb: DEFAULT_ASYNC_RAM_WARN_MB,
+                ram_critical_mb: DEFAULT_ASYNC_RAM_CRITICAL_MB,
+                coalesce_window_ms: DEFAULT_ASYNC_COALESCE_WINDOW_MS,
+                write_throttle_per_sec: DEFAULT_ASYNC_WRITE_THROTTLE_PER_SEC,
+            },
+        }
+    }
+
+    fn owner_shard(&self, sender: u64) -> usize {
+        if self.async_state.shard_count == 0 {
+            return 0;
+        }
+        (sender as usize) % self.async_state.shard_count
+    }
+
+    fn refresh_async_guard_mode(&mut self) {
+        let mut sys = System::new();
+        sys.refresh_memory();
+        let avail_bytes = Self::normalize_available_bytes(sys.available_memory());
+        let avail_mb = avail_bytes / (1024 * 1024);
+
+        self.async_state.guard_mode = if avail_mb <= self.async_state.policy.ram_critical_mb {
+            "critical".to_string()
+        } else if avail_mb <= self.async_state.policy.ram_warn_mb {
+            "warn".to_string()
+        } else {
+            "normal".to_string()
+        };
+    }
+
+    fn now_ms() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(d) => d.as_millis() as u64,
+            Err(_) => 0,
+        }
+    }
+
+    fn refresh_async_processed_rate(&mut self) {
+        let now = Self::now_ms();
+        if self.async_state.last_rate_ts_ms == 0 {
+            self.async_state.last_rate_ts_ms = now;
+            self.async_state.last_rate_processed_total = self.async_state.processed_total;
+            self.async_state.processed_per_sec = 0.0;
+            return;
+        }
+
+        let dt_ms = now.saturating_sub(self.async_state.last_rate_ts_ms);
+        if dt_ms < 200 {
+            return;
+        }
+        let dp = self
+            .async_state
+            .processed_total
+            .saturating_sub(self.async_state.last_rate_processed_total);
+        self.async_state.processed_per_sec = (dp as f64) / (dt_ms as f64 / 1000.0);
+        self.async_state.last_rate_ts_ms = now;
+        self.async_state.last_rate_processed_total = self.async_state.processed_total;
+    }
+
+    fn build_async_snapshot(&mut self) -> (HashMap<u64, Vec<AsyncSynapse>>, HashMap<u64, f32>) {
+        let mut senders: Vec<u64> = self.node_index.keys().copied().collect();
+        senders.sort_unstable();
+
+        let mut adjacency: HashMap<u64, Vec<AsyncSynapse>> = HashMap::new();
+        for sender in senders {
+            let conns = self.get_connections_internal(sender);
+            let syns: Vec<AsyncSynapse> = conns
+                .into_iter()
+                .map(|(receiver_id, weight)| AsyncSynapse { receiver_id, weight })
+                .collect();
+            adjacency.insert(sender, syns);
+        }
+
+        let mut thresholds: HashMap<u64, f32> = HashMap::new();
+        for (node, meta) in &self.node_index {
+            thresholds.insert(*node, meta.threshold);
+        }
+        (adjacency, thresholds)
+    }
+
+    fn sync_async_state_from_shared(&mut self) {
+        let Some(ar) = self.async_runtime.as_ref() else {
+            return;
+        };
+        let snapshot = ar.rt.block_on(async {
+            let s = ar.shared.lock().await;
+            (
+                s.ingress_paused,
+                s.global_queue_len,
+                s.processed_total,
+                s.processed_per_sec,
+                s.dropped_total,
+                s.coalesced_total,
+                s.hop_total,
+                s.guard_mode.clone(),
+                s.per_shard_queue_len.clone(),
+                s.per_shard_processed.clone(),
+            )
+        });
+
+        self.async_state.ingress_paused = snapshot.0;
+        self.async_state.global_queue_len = snapshot.1;
+        self.async_state.processed_total = snapshot.2;
+        self.async_state.processed_per_sec = snapshot.3;
+        self.async_state.dropped_total = snapshot.4;
+        self.async_state.coalesced_total = snapshot.5;
+        self.async_state.hop_total = snapshot.6;
+        self.async_state.guard_mode = snapshot.7;
+        self.async_state.per_shard_queue_len = snapshot.8;
+        self.async_state.per_shard_processed = snapshot.9;
     }
 
     fn env_policy(key: &str, default: &str) -> String {
@@ -951,6 +1186,8 @@ impl RagpEngine {
                 DEFAULT_INNATE_REGISTRY_VERSION,
             ),
             loaded_registry_version: DEFAULT_INNATE_REGISTRY_VERSION,
+            async_state: Self::default_async_state(),
+            async_runtime: None,
         };
 
         engine.load_node_index();
@@ -1018,6 +1255,296 @@ impl RagpEngine {
                 self.registry_version
             )
         }
+    }
+
+    fn start_async_runtime(&mut self, config: Option<&PyAny>) -> PyResult<String> {
+        if let Some(obj) = config {
+            if !obj.is_none() {
+                let cfg = obj.downcast::<PyDict>()?;
+                if let Some(v) = cfg.get_item("shard_count")? {
+                    if let Ok(sc) = v.extract::<usize>() {
+                        self.async_state.shard_count = sc.max(2);
+                    }
+                }
+                if let Some(v) = cfg.get_item("ram_warn_mb")? {
+                    if let Ok(x) = v.extract::<u64>() {
+                        self.async_state.policy.ram_warn_mb = x.max(128);
+                    }
+                }
+                if let Some(v) = cfg.get_item("ram_critical_mb")? {
+                    if let Ok(x) = v.extract::<u64>() {
+                        self.async_state.policy.ram_critical_mb =
+                            x.max(self.async_state.policy.ram_warn_mb);
+                    }
+                }
+                if let Some(v) = cfg.get_item("coalesce_window_ms")? {
+                    if let Ok(x) = v.extract::<u64>() {
+                        self.async_state.policy.coalesce_window_ms = x.max(50);
+                    }
+                }
+                if let Some(v) = cfg.get_item("write_throttle_per_sec")? {
+                    if let Ok(x) = v.extract::<u32>() {
+                        self.async_state.policy.write_throttle_per_sec = x.max(100);
+                    }
+                }
+            }
+        }
+
+        if self.async_runtime.is_some() {
+            self.sync_async_state_from_shared();
+            return Ok(format!(
+                "async_on=true shards={} guard_mode={}",
+                self.async_state.shard_count, self.async_state.guard_mode
+            ));
+        }
+
+        self.refresh_async_guard_mode();
+        let shard_count = self.async_state.shard_count.max(2);
+        let (adjacency, threshold) = self.build_async_snapshot();
+        let guard_mode = self.async_state.guard_mode.clone();
+
+        let shared = Arc::new(TokioMutex::new(AsyncShared {
+            shard_count,
+            adjacency,
+            threshold,
+            activation: HashMap::new(),
+            ingress_paused: false,
+            global_queue_len: 0,
+            per_shard_queue_len: vec![0; shard_count],
+            processed_total: 0,
+            processed_per_sec: 0.0,
+            last_rate_ts_ms: 0,
+            last_rate_processed_total: 0,
+            dropped_total: 0,
+            coalesced_total: 0,
+            hop_total: 0,
+            guard_mode,
+            per_shard_processed: vec![0; shard_count],
+        }));
+
+        let rt = TokioRuntimeBuilder::new_multi_thread()
+            .worker_threads(shard_count.max(2))
+            .enable_all()
+            .build()
+            .map_err(|e| PyValueError::new_err(format!("tokio runtime init failed: {e}")))?;
+
+        let mut shard_txs: Vec<mpsc::UnboundedSender<ShardCommand>> = Vec::with_capacity(shard_count);
+        let mut shard_rxs: Vec<mpsc::UnboundedReceiver<ShardCommand>> = Vec::with_capacity(shard_count);
+        for _ in 0..shard_count {
+            let (tx, rx) = mpsc::unbounded_channel();
+            shard_txs.push(tx);
+            shard_rxs.push(rx);
+        }
+
+        for (idx, rx) in shard_rxs.into_iter().enumerate() {
+            let shared_cloned = Arc::clone(&shared);
+            let senders = shard_txs.clone();
+            rt.spawn(async move {
+                shard_actor_loop(idx, rx, senders, shared_cloned).await;
+            });
+        }
+
+        self.async_runtime = Some(AsyncActorRuntime {
+            rt,
+            shard_txs,
+            shared,
+            global_tick: Arc::new(AtomicU64::new(self.tick as u64)),
+        });
+
+        self.async_state.enabled = true;
+        self.async_state.ingress_paused = false;
+        self.async_state.global_queue_len = 0;
+        self.async_state.processed_total = 0;
+        self.async_state.processed_per_sec = 0.0;
+        self.async_state.dropped_total = 0;
+        self.async_state.coalesced_total = 0;
+        self.async_state.hop_total = 0;
+        self.async_state.per_shard_queue_len = vec![0; shard_count];
+        self.async_state.per_shard_processed = vec![0; shard_count];
+
+        Ok(format!(
+            "async_on=true shards={} guard_mode={}",
+            shard_count, self.async_state.guard_mode
+        ))
+    }
+
+    fn stop_async_runtime(&mut self) -> String {
+        if let Some(runtime) = self.async_runtime.take() {
+            for tx in &runtime.shard_txs {
+                let _ = tx.send(ShardCommand::Stop);
+            }
+            drop(runtime);
+        }
+        self.async_state.enabled = false;
+        self.async_state.ingress_paused = false;
+        self.async_state.global_queue_len = 0;
+        self.async_state.per_shard_queue_len = vec![0; self.async_state.shard_count];
+        "async_on=false".to_string()
+    }
+
+    fn submit_stimulus(
+        &mut self,
+        node_id: u64,
+        strength: f32,
+        source: Option<String>,
+        _ts_ms: Option<u64>,
+    ) -> PyResult<bool> {
+        self.strict_check_node(node_id, "submit_stimulus(node_id)")?;
+        self.refresh_async_guard_mode();
+        let Some(runtime) = self.async_runtime.as_ref() else {
+            return Err(PyValueError::new_err(
+                "async runtime is OFF; call start_async_runtime first",
+            ));
+        };
+        let owner = self.owner_shard(node_id);
+
+        let ingress_ok = runtime.rt.block_on(async {
+            let mut s = runtime.shared.lock().await;
+            s.guard_mode = self.async_state.guard_mode.clone();
+            if s.ingress_paused {
+                s.dropped_total = s.dropped_total.saturating_add(1);
+                return false;
+            }
+            if s.guard_mode == "critical" && s.global_queue_len > 20_000 {
+                s.dropped_total = s.dropped_total.saturating_add(1);
+                return false;
+            }
+            s.global_queue_len = s.global_queue_len.saturating_add(1);
+            if let Some(slot) = s.per_shard_queue_len.get_mut(owner) {
+                *slot = slot.saturating_add(1);
+            }
+            true
+        });
+        if !ingress_ok {
+            self.sync_async_state_from_shared();
+            return Ok(false);
+        }
+
+        let (tx, rx) = oneshot::channel();
+        let cmd = ShardCommand::Stimulus {
+            node_id,
+            strength: strength.max(0.0).min(1.0),
+            source: source.unwrap_or_else(|| "unknown".to_string()),
+            origin_tick: runtime.global_tick.fetch_add(1, Ordering::SeqCst),
+            reply: tx,
+        };
+        if runtime.shard_txs[owner].send(cmd).is_err() {
+            return Err(PyValueError::new_err("failed to route stimulus to owner shard"));
+        }
+
+        let accepted = runtime.rt.block_on(async { rx.await.unwrap_or(false) });
+        self.sync_async_state_from_shared();
+        Ok(accepted)
+    }
+
+    fn submit_stimuli(&mut self, batch: Vec<(u64, f32, String)>) -> PyResult<PyObject> {
+        let mut accepted: u64 = 0;
+        let mut rejected: u64 = 0;
+        let mut coalesced_in_call: u64 = 0;
+        let mut grouped: HashMap<(u64, String), f32> = HashMap::new();
+        for (node_id, strength, source) in batch {
+            let key = (node_id, source);
+            if let Some(prev) = grouped.get_mut(&key) {
+                if strength > *prev {
+                    *prev = strength;
+                }
+                coalesced_in_call = coalesced_in_call.saturating_add(1);
+            } else {
+                grouped.insert(key, strength);
+            }
+        }
+        if let Some(runtime) = self.async_runtime.as_ref() {
+            runtime.rt.block_on(async {
+                let mut s = runtime.shared.lock().await;
+                s.coalesced_total = s.coalesced_total.saturating_add(coalesced_in_call);
+            });
+        }
+
+        let mut grouped_vec: Vec<((u64, String), f32)> = grouped.into_iter().collect();
+        grouped_vec.sort_by_key(|((node_id, _), _)| self.owner_shard(*node_id));
+
+        for ((node_id, source), strength) in grouped_vec {
+            match self.submit_stimulus(node_id, strength, Some(source), None)? {
+                true => accepted = accepted.saturating_add(1),
+                false => rejected = rejected.saturating_add(1),
+            }
+        }
+        Python::with_gil(|py| {
+            let out = PyDict::new_bound(py);
+            out.set_item("ok", true)?;
+            out.set_item("accepted", accepted)?;
+            out.set_item("rejected", rejected)?;
+            out.set_item("coalesced", coalesced_in_call)?;
+            Ok(out.to_object(py))
+        })
+    }
+
+    fn get_async_metrics(&mut self) -> PyResult<PyObject> {
+        self.refresh_async_guard_mode();
+        self.sync_async_state_from_shared();
+        Python::with_gil(|py| {
+            let out = PyDict::new_bound(py);
+            out.set_item("async_on", self.async_state.enabled)?;
+            out.set_item("ingress_paused", self.async_state.ingress_paused)?;
+            out.set_item("shard_count", self.async_state.shard_count)?;
+            out.set_item("global_queue_len", self.async_state.global_queue_len)?;
+            out.set_item("processed_total", self.async_state.processed_total)?;
+            out.set_item("processed_per_sec", self.async_state.processed_per_sec)?;
+            out.set_item("dropped_total", self.async_state.dropped_total)?;
+            out.set_item("coalesced_total", self.async_state.coalesced_total)?;
+            out.set_item("hop_total", self.async_state.hop_total)?;
+            out.set_item("guard_mode", self.async_state.guard_mode.clone())?;
+
+            let shard_rows = PyDict::new_bound(py);
+            for (idx, cnt) in self.async_state.per_shard_processed.iter().enumerate() {
+                shard_rows.set_item(idx, *cnt)?;
+            }
+            out.set_item("per_shard_processed", shard_rows)?;
+            let shard_queues = PyDict::new_bound(py);
+            for (idx, qlen) in self.async_state.per_shard_queue_len.iter().enumerate() {
+                shard_queues.set_item(idx, *qlen)?;
+            }
+            out.set_item("per_shard_queue_len", shard_queues)?;
+            Ok(out.to_object(py))
+        })
+    }
+
+    fn set_async_policy(
+        &mut self,
+        ram_warn_mb: Option<u64>,
+        ram_critical_mb: Option<u64>,
+        coalesce_window_ms: Option<u64>,
+        write_throttle_per_sec: Option<u32>,
+    ) -> PyResult<PyObject> {
+        if let Some(v) = ram_warn_mb {
+            self.async_state.policy.ram_warn_mb = v.max(128);
+        }
+        if let Some(v) = ram_critical_mb {
+            self.async_state.policy.ram_critical_mb = v.max(self.async_state.policy.ram_warn_mb);
+        }
+        if let Some(v) = coalesce_window_ms {
+            self.async_state.policy.coalesce_window_ms = v.max(50);
+        }
+        if let Some(v) = write_throttle_per_sec {
+            self.async_state.policy.write_throttle_per_sec = v.max(100);
+        }
+        self.refresh_async_guard_mode();
+        if let Some(runtime) = self.async_runtime.as_ref() {
+            runtime.rt.block_on(async {
+                let mut s = runtime.shared.lock().await;
+                s.guard_mode = self.async_state.guard_mode.clone();
+            });
+        }
+        Python::with_gil(|py| {
+            let out = PyDict::new_bound(py);
+            out.set_item("ok", true)?;
+            out.set_item("ram_warn_mb", self.async_state.policy.ram_warn_mb)?;
+            out.set_item("ram_critical_mb", self.async_state.policy.ram_critical_mb)?;
+            out.set_item("coalesce_window_ms", self.async_state.policy.coalesce_window_ms)?;
+            out.set_item("write_throttle_per_sec", self.async_state.policy.write_throttle_per_sec)?;
+            out.set_item("guard_mode", self.async_state.guard_mode.clone())?;
+            Ok(out.to_object(py))
+        })
     }
 
     fn get_connections(&mut self, sender: u64) -> PyResult<Vec<(u64, f32)>> {
@@ -1201,6 +1728,24 @@ impl RagpEngine {
         self.strict_check_node(receiver, "update_weight(receiver)")?;
 
         let weight = new_weight.max(0.0).min(1.0);
+        if let Some(runtime) = self.async_runtime.as_ref() {
+            let owner = self.owner_shard(sender);
+            let (tx, rx) = oneshot::channel();
+            let cmd = ShardCommand::UpdateEdge {
+                sender,
+                receiver,
+                weight,
+                reply: tx,
+            };
+            if runtime.shard_txs[owner].send(cmd).is_err() {
+                return Err(PyValueError::new_err("failed to route update_weight to owner shard"));
+            }
+            let ok = runtime.rt.block_on(async { rx.await.unwrap_or(false) });
+            if !ok {
+                return Err(PyValueError::new_err("async shard rejected update_weight"));
+            }
+        }
+
         let ts = self.tick;
         self.tick = self.tick.saturating_add(1);
 
@@ -1221,6 +1766,22 @@ impl RagpEngine {
     }
 
     fn consolidate(&mut self) -> (u32, u32) {
+        let async_exists = self.async_runtime.is_some();
+        if async_exists {
+            if let Some(runtime) = self.async_runtime.as_ref() {
+                runtime.rt.block_on(async {
+                    let mut s = runtime.shared.lock().await;
+                    s.ingress_paused = true;
+                });
+                for tx in &runtime.shard_txs {
+                    let (ack_tx, ack_rx) = oneshot::channel();
+                    let _ = tx.send(ShardCommand::Flush { reply: ack_tx });
+                    let _ = runtime.rt.block_on(async { ack_rx.await });
+                }
+                self.sync_async_state_from_shared();
+            }
+        }
+
         let mut merged = 0_u32;
         let mut pruned = 0_u32;
 
@@ -1267,6 +1828,22 @@ impl RagpEngine {
         self.refresh_cache_budget();
         self.recompute_pinned_set(true);
 
+        if async_exists {
+            let (adjacency, threshold) = self.build_async_snapshot();
+            if let Some(runtime) = self.async_runtime.as_ref() {
+                runtime.rt.block_on(async {
+                    let mut s = runtime.shared.lock().await;
+                    s.adjacency = adjacency;
+                    s.threshold = threshold;
+                    s.activation.clear();
+                    s.global_queue_len = 0;
+                    s.per_shard_queue_len = vec![0; s.shard_count];
+                    s.ingress_paused = false;
+                });
+                self.sync_async_state_from_shared();
+            }
+        }
+
         println!("[Konsolidasi] merged={} pruned={}", merged, pruned);
         (merged, pruned)
     }
@@ -1276,27 +1853,224 @@ impl RagpEngine {
         let budget_mb = self.cache_budget_bytes as f64 / (1024.0 * 1024.0);
         let cache_mb = self.cache_bytes_est as f64 / (1024.0 * 1024.0);
         let chunk_count = self.chunk_file_starts().len();
+        let mut active_count = self.activation.len();
+        let mut queue_len = self.async_state.global_queue_len;
+        let mut guard_mode = self.async_state.guard_mode.clone();
+        if let Some(runtime) = self.async_runtime.as_ref() {
+            let snap = runtime.rt.block_on(async {
+                let s = runtime.shared.lock().await;
+                (s.activation.len(), s.global_queue_len, s.guard_mode.clone())
+            });
+            active_count = snap.0;
+            queue_len = snap.1;
+            guard_mode = snap.2;
+        }
 
         format!(
-            "Nodes={} | Chunks={} | Delta nodes={} entries={} | Active={} | Tick={} | reg_ver={} | pinned_nodes={} | lru_nodes={} | cache_budget_mb={:.1} | cache_bytes_est_mb={:.1}",
+            "Nodes={} | Chunks={} | Delta nodes={} entries={} | Active={} | Tick={} | reg_ver={} | pinned_nodes={} | lru_nodes={} | cache_budget_mb={:.1} | cache_bytes_est_mb={:.1} | async_on={} | shards={} | global_queue_len={} | guard_mode={}",
             self.node_index.len(),
             chunk_count,
             self.delta_index.len(),
             delta_total,
-            self.activation.len(),
+            active_count,
             self.tick,
             self.registry_version,
             self.pinned_cache.len(),
             self.base_cache.len(),
             budget_mb,
-            cache_mb
+            cache_mb,
+            self.async_state.enabled,
+            self.async_state.shard_count,
+            queue_len,
+            guard_mode
         )
     }
 
     fn get_activation(&self) -> Vec<(u64, f32)> {
+        if let Some(runtime) = self.async_runtime.as_ref() {
+            let mut out: Vec<(u64, f32)> = runtime.rt.block_on(async {
+                let s = runtime.shared.lock().await;
+                s.activation.iter().map(|(k, v)| (*k, *v)).collect()
+            });
+            out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            return out;
+        }
         let mut out: Vec<(u64, f32)> = self.activation.iter().map(|(k, v)| (*k, *v)).collect();
         out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         out
+    }
+}
+
+async fn shard_actor_loop(
+    shard_id: usize,
+    mut rx: mpsc::UnboundedReceiver<ShardCommand>,
+    shard_txs: Vec<mpsc::UnboundedSender<ShardCommand>>,
+    shared: Arc<TokioMutex<AsyncShared>>,
+) {
+    while let Some(cmd) = rx.recv().await {
+        match cmd {
+            ShardCommand::Stimulus {
+                node_id,
+                strength,
+                source,
+                origin_tick,
+                reply,
+            } => {
+                decrement_queue_on_pop(shard_id, &shared).await;
+                process_seed_message(
+                    shard_id,
+                    node_id,
+                    strength,
+                    origin_tick,
+                    Some(source),
+                    &shard_txs,
+                    &shared,
+                )
+                .await;
+                let _ = reply.send(true);
+            }
+            ShardCommand::Hop {
+                node_id,
+                strength,
+                origin_tick,
+                source_shard: _,
+            } => {
+                decrement_queue_on_pop(shard_id, &shared).await;
+                process_seed_message(
+                    shard_id,
+                    node_id,
+                    strength,
+                    origin_tick,
+                    None,
+                    &shard_txs,
+                    &shared,
+                )
+                .await;
+            }
+            ShardCommand::UpdateEdge {
+                sender,
+                receiver,
+                weight,
+                reply,
+            } => {
+                decrement_queue_on_pop(shard_id, &shared).await;
+                let mut s = shared.lock().await;
+                let list = s.adjacency.entry(sender).or_default();
+                if let Some(existing) = list.iter_mut().find(|e| e.receiver_id == receiver) {
+                    existing.weight = weight;
+                } else {
+                    list.push(AsyncSynapse { receiver_id: receiver, weight });
+                }
+                let _ = reply.send(true);
+            }
+            ShardCommand::Flush { reply } => {
+                let _ = reply.send(());
+            }
+            ShardCommand::Stop => {
+                break;
+            }
+        }
+    }
+}
+
+async fn decrement_queue_on_pop(shard_id: usize, shared: &Arc<TokioMutex<AsyncShared>>) {
+    let mut s = shared.lock().await;
+    s.global_queue_len = s.global_queue_len.saturating_sub(1);
+    if let Some(slot) = s.per_shard_queue_len.get_mut(shard_id) {
+        *slot = slot.saturating_sub(1);
+    }
+}
+
+async fn process_seed_message(
+    shard_id: usize,
+    node_id: u64,
+    strength: f32,
+    _origin_tick: u64,
+    _source: Option<String>,
+    shard_txs: &[mpsc::UnboundedSender<ShardCommand>],
+    shared: &Arc<TokioMutex<AsyncShared>>,
+) {
+    let mut queue: VecDeque<(u64, f32, u8)> = VecDeque::new();
+    queue.push_back((node_id, strength.max(0.0).min(1.0), 0));
+
+    while let Some((node, node_strength, depth)) = queue.pop_front() {
+        if depth >= MAX_SPREAD_DEPTH {
+            continue;
+        }
+
+        let (connections, threshold_map, shard_count) = {
+            let s = shared.lock().await;
+            (
+                s.adjacency.get(&node).cloned().unwrap_or_default(),
+                s.threshold.clone(),
+                s.shard_count,
+            )
+        };
+
+        for syn in connections {
+            let incoming = node_strength * syn.weight;
+            let threshold = threshold_map
+                .get(&syn.receiver_id)
+                .copied()
+                .unwrap_or(DEFAULT_THRESHOLD);
+            if incoming < threshold {
+                continue;
+            }
+
+            {
+                let mut s = shared.lock().await;
+                let slot = s.activation.entry(syn.receiver_id).or_insert(0.0);
+                if incoming > *slot {
+                    *slot = incoming;
+                } else {
+                    continue;
+                }
+            }
+
+            let target_shard = if shard_count == 0 {
+                0
+            } else {
+                (syn.receiver_id as usize) % shard_count
+            };
+            if target_shard == shard_id {
+                queue.push_back((syn.receiver_id, incoming, depth.saturating_add(1)));
+            } else {
+                {
+                    let mut s = shared.lock().await;
+                    s.hop_total = s.hop_total.saturating_add(1);
+                    s.global_queue_len = s.global_queue_len.saturating_add(1);
+                    if let Some(slot) = s.per_shard_queue_len.get_mut(target_shard) {
+                        *slot = slot.saturating_add(1);
+                    }
+                }
+                let _ = shard_txs[target_shard].send(ShardCommand::Hop {
+                    node_id: syn.receiver_id,
+                    strength: incoming,
+                    origin_tick: 0,
+                    source_shard: shard_id,
+                });
+            }
+        }
+    }
+
+    let now_ms = RagpEngine::now_ms();
+    let mut s = shared.lock().await;
+    s.processed_total = s.processed_total.saturating_add(1);
+    if let Some(slot) = s.per_shard_processed.get_mut(shard_id) {
+        *slot = slot.saturating_add(1);
+    }
+    if s.last_rate_ts_ms == 0 {
+        s.last_rate_ts_ms = now_ms;
+        s.last_rate_processed_total = s.processed_total;
+        s.processed_per_sec = 0.0;
+    } else {
+        let dt_ms = now_ms.saturating_sub(s.last_rate_ts_ms);
+        if dt_ms >= 200 {
+            let dp = s.processed_total.saturating_sub(s.last_rate_processed_total);
+            s.processed_per_sec = (dp as f64) / (dt_ms as f64 / 1000.0);
+            s.last_rate_ts_ms = now_ms;
+            s.last_rate_processed_total = s.processed_total;
+        }
     }
 }
 

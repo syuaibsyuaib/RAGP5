@@ -5,6 +5,7 @@ import shutil
 import sys
 
 from environment import translate
+from ragp_bootstrap import innate_registry_version, node_pool_full, seed_initial_knowledge
 from ragp_loop import run_survival_loop
 
 try:
@@ -16,8 +17,6 @@ except ImportError:
 
 
 STORAGE_DIR = os.path.join(os.getcwd(), "ragp_storage")
-NODE_POOL_FULL = list(range(1, 110))
-INNATE_REGISTRY_VERSION = 1
 
 DEFAULT_MAX_STEPS = 100
 DEFAULT_SEED = 42
@@ -45,36 +44,6 @@ def rescorla_wagner(old_weight: float, reward: float, count: int = 1) -> float:
     alpha = 1.0 / max(count, 1)
     new_w = old_weight + alpha * (reward - old_weight)
     return max(0.0, min(1.0, new_w))
-
-
-def seed_initial_knowledge(engine: RagpEngine):
-    print("[Init] Menanamkan insting dasar...")
-
-    engine.update_weight(1, 45, 0.3)    # BAHAYA -> LARI
-    engine.update_weight(1, 88, 0.2)    # BAHAYA -> SEMBUNYI
-    engine.update_weight(1, 12, 0.1)    # BAHAYA -> DIAM
-
-    engine.update_weight(103, 106, 0.3) # LAPAR -> CARI_MAKAN
-    engine.update_weight(103, 107, 0.2) # LAPAR -> MAKAN
-
-    engine.update_weight(100, 108, 0.3) # LELAH -> ISTIRAHAT
-    engine.update_weight(100, 109, 0.2) # LELAH -> TIDUR
-
-    engine.update_weight(104, 109, 0.3) # SAKIT -> TIDUR
-    engine.update_weight(104, 108, 0.2) # SAKIT -> ISTIRAHAT
-
-    engine.update_weight(45, 100, 0.15) # Cost LARI
-    engine.update_weight(88, 100, 0.05) # Cost SEMBUNYI
-    engine.update_weight(12, 100, 0.02) # Cost DIAM
-    engine.update_weight(106, 100, 0.10) # Cost CARI_MAKAN
-    engine.update_weight(107, 103, 0.05) # MAKAN menurunkan LAPAR
-
-    engine.update_weight(101, 88, 0.2)  # MALAM -> SEMBUNYI
-    engine.update_weight(101, 45, 0.05) # MALAM -> LARI rendah
-
-    merged, pruned = engine.consolidate()
-    print(f"[Init] Insting dasar tersimpan. merged={merged} pruned={pruned}")
-    print(f"[Init] {engine.status()}")
 
 
 def consolidate_hippocampus(engine: RagpEngine, buffer: dict, verbose: bool = True):
@@ -124,7 +93,8 @@ def build_konsolidasi_fn():
 
 
 def main():
-    os.environ.setdefault("RAGP_INNATE_REGISTRY_VERSION", str(INNATE_REGISTRY_VERSION))
+    os.environ.setdefault("RAGP_INNATE_REGISTRY_VERSION", str(innate_registry_version()))
+    async_enabled = _truthy(os.getenv("RAGP_ASYNC"))
     reset_requested = should_reset(sys.argv[1:])
     if reset_requested and os.path.exists(STORAGE_DIR):
         shutil.rmtree(STORAGE_DIR)
@@ -132,8 +102,11 @@ def main():
 
     first_init = not base_file_exists(STORAGE_DIR)
     engine = RagpEngine(STORAGE_DIR)
-    migration_status = engine.ensure_innate_registry(NODE_POOL_FULL)
+    migration_status = engine.ensure_innate_registry(node_pool_full())
     print(f"[Registry] {migration_status}")
+    if async_enabled:
+        msg = engine.start_async_runtime(None)
+        print(f"[Async] {msg}")
 
     if first_init:
         print(f"[Init] Node pool dibuat. {engine.status()}")
